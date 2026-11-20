@@ -126,7 +126,7 @@ If port 8086 is taken by something else, change `overlay.port` in the Settings w
 
 ## Alert hook
 
-The widget can run a command when a temperature is high enough to be a real problem. It is meant for things like a sound, a notification or a voice announcement, not for every warm reading.
+Critical alerts can go to whatever you already use: a voice, a Discord channel, your own script or an AI agent. The widget runs one command when a temperature is high enough to be a real problem, and you decide what that command does. It is not for every warm reading.
 
 Defaults in `settings.example.json`:
 
@@ -155,20 +155,42 @@ The rules:
 
 The same values are also set as environment variables: `TEMPWIDGET_SENSOR`, `TEMPWIDGET_LABEL`, `TEMPWIDGET_TEMP`, `TEMPWIDGET_THRESHOLD`.
 
-The command is started directly, not through `cmd.exe`, with no window. Example that makes Windows speak the alert:
+The command is started directly, not through `cmd.exe`, with no window. Copy one of these into the `alerts` section of your `settings.json` (keep `critical`, `hold_seconds` and `cooldown_seconds` from the example file):
+
+**1. Windows text-to-speech**
 
 ```json
-"alerts": {
-  "enabled": true,
-  "command": [
-    "powershell", "-NoProfile", "-Command",
-    "Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{label} is at {temp} degrees')"
-  ],
-  "hold_seconds": 10,
-  "cooldown_seconds": 300,
-  "critical": { "gpu": 88, "gpu_hotspot": 100, "gpu_memory": 100, "cpu": 100 }
-}
+"command": [
+  "powershell", "-NoProfile", "-Command",
+  "Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{label} is at {temp} degrees')"
+]
 ```
+
+**2. Discord webhook message (curl.exe ships with Windows 10 and 11)**
+
+```json
+"command": [
+  "curl.exe", "-s", "-X", "POST",
+  "-H", "Content-Type: application/json",
+  "-d", "{\"content\": \"Temp alert: {label} is at {temp} degrees\"}",
+  "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+]
+```
+
+Create the webhook under Server Settings > Integrations > Webhooks. The webhook URL works like a password, so keep it in `settings.json` (which is not committed) and never in `settings.example.json`.
+
+**3. HTTP POST to your own AI agent or voice assistant**
+
+```json
+"command": [
+  "curl.exe", "-s", "-X", "POST",
+  "-H", "Content-Type: application/json",
+  "-d", "{\"sensor\": \"{sensor}\", \"label\": \"{label}\", \"temp\": {temp}, \"threshold\": {threshold}}",
+  "http://localhost:PORT/your-endpoint"
+]
+```
+
+Replace the URL with whatever your agent listens on. If it needs a key, add a header such as `"-H", "Authorization: Bearer YOUR_KEY"` in `settings.json` only. Anything that can run a program works the same way: put its path and arguments in the list.
 
 Use **Test alert hook** in the right-click menu (or **Test alert** in Settings) to run the command once with made-up values. The command comes from your own `settings.json`, so only put commands there that you trust.
 
