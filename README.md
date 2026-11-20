@@ -129,7 +129,7 @@ If port 8086 is taken by something else, change `overlay.port` in the Settings w
 
 ## Logs, history and peak temps
 
-**Log.** `temp_widget.log` sits next to the script. On every start it records the widget version, Python version, GPU name, and whether `nvidia-smi` and LibreHardwareMonitor were found. After that it only writes when something changes: alerts, a sensor source going away or coming back (one line each time, no repeats), and errors. Any crash or unexpected error is written with its full traceback, including errors inside the Settings window and background threads. When the file passes 500 KB it is renamed to `temp_widget.log.old`.
+**Log.** `temp_widget.log` sits next to the script (see Notes for `--settings` and `--log`). On every start it records the widget version, Python version, GPU name, and whether `nvidia-smi` and LibreHardwareMonitor were found. After that it only writes when something changes: alerts, a sensor source going away or coming back (one line each time, no repeats), and errors. Any crash or unexpected error is written with its full traceback, including errors inside the Settings window and background threads. When the file passes 500 KB it is renamed to `temp_widget.log.old`.
 
 **Debug logging.** Tick **Debug logging** in Settings (`"logging": {"debug": true}`) to also log every poll with its readings, settings changes, overlay requests and alert progress. Leave it off normally.
 
@@ -236,13 +236,16 @@ To make a desktop shortcut, create one to `Start-Temp-Widget.bat` and pick `temp
 
 - Only NVIDIA GPUs are read through nvidia-smi. Hotspot and memory temps come from LibreHardwareMonitor, so they show up for any card it supports.
 - Temperatures are in °C.
-- Command line options: `--settings <file>` uses a different settings file (and allows a second widget), `--open-settings [general|appearance]` opens the Settings window on start, `--version` prints the version, `--test-crash main|thread|tk` raises a fake error to check that tracebacks reach the log.
+- Command line options: `--settings <file>` uses a different settings file (and allows a second widget), `--open-settings [general|appearance]` opens the Settings window on start, `--log <file>` writes the log somewhere else, `--version` prints the version, `--test-crash main|thread|tk` raises a fake error to check that tracebacks reach the log. A widget started with `--settings` keeps its log (`<settings name>.log`) and history (`<settings name>-history/`) next to that file, so a test copy never writes into your main widget's log.
 
 ## Changes
 
+- **v1.1.1**: when `nvidia-smi` times out or fails the widget now says "nvidia-smi not responding" ("not found" is only for a missing program). A widget started with `--settings` writes its log and history next to that settings file instead of into the main widget's. `--log <file>` picks the log location. Open log folder opens the folder the log is really in.
 - **v1.1**: logging (startup report, source changes, tracebacks for every crash, debug option), optional temperature history, peak temps window, open log shortcuts, version shown in Settings. Fixed: a second widget could silently share the overlay port instead of reporting that it was in use.
 - **v1.0**: first release.
 
 ## License
 
 MIT, see `LICENSE`.
+
+Questions or ideas? Reach out: superzydanofficial [at] gmail [dot] com

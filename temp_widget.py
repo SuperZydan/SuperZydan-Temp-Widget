@@ -42,7 +42,7 @@ LOG_FILE = HERE / "temp_widget.log"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 KEY = "#010101"  # this exact color becomes see-through
 APP_NAME = "Temp Widget"
-VERSION = "1.1"
+VERSION = "1.1.1"
 HISTORY_DIR = HERE / "history"
 DEBUG = False  # set from settings: logging.debug
 
@@ -181,7 +181,19 @@ def install_exception_hooks() -> None:
     threading.excepthook = thread_hook
 
 
-SOURCE_ERR: dict[str, str] = {}   # last failure reason per source, used for the "stopped responding" log line
+def configure_paths(settings_path: Path, log_path: Path | None = None) -> None:
+    """A widget started with its own settings file (a test run, a second widget) keeps its own log and history
+    next to that file, so it never writes into the main widget's log. --log overrides the log location."""
+    global LOG_FILE, HISTORY_DIR
+    if settings_path.resolve() != (HERE / "settings.json").resolve():
+        LOG_FILE = settings_path.with_suffix(".log")
+        HISTORY_DIR = settings_path.parent / (settings_path.stem + "-history")
+    if log_path is not None:
+        LOG_FILE = log_path
+
+
+SOURCE_ERR: dict[str, str] = {}    # last failure reason per source, used for the "stopped responding" log line
+SOURCE_KIND: dict[str, str] = {}   # "missing" (program not there) or "error" (there, but timed out or failed)
 
 
 def gpu_name() -> str | None:
@@ -390,17 +402,24 @@ def read_gpu() -> dict | None:
         )
         out = proc.stdout.strip().splitlines()
         if not out:
+            SOURCE_KIND["nvidia"] = "error"
             SOURCE_ERR["nvidia"] = f"no output, exit code {proc.returncode} {proc.stderr.strip()[:200]}".strip()
             return None
         t, fan, load, power, vu, vt = [p.strip() for p in out[0].split(",")]
         vu, vt = num(vu), num(vt)
         SOURCE_ERR.pop("nvidia", None)
+        SOURCE_KIND.pop("nvidia", None)
         return {"temp": num(t), "fan": num(fan), "load": num(load), "power": num(power),
                 "vram_used": vu / 1024 if vu is not None else None,
                 "vram_total": vt / 1024 if vt is not None else None}
     except FileNotFoundError:
+        SOURCE_KIND["nvidia"] = "missing"
         SOURCE_ERR["nvidia"] = "nvidia-smi not found on PATH"
+    except subprocess.TimeoutExpired:
+        SOURCE_KIND["nvidia"] = "error"
+        SOURCE_ERR["nvidia"] = "nvidia-smi timed out after 5 s"
     except Exception as e:
+        SOURCE_KIND["nvidia"] = "error"
         SOURCE_ERR["nvidia"] = f"{type(e).__name__}: {e}"
     return None
 
@@ -498,6 +517,7 @@ def collect(cfg: dict) -> dict:
     lhm = read_lhm(cfg["lhm_url"])
     return {
         "gpu": gpu,
+        "gpu_problem": None if gpu else SOURCE_KIND.get("nvidia", "error"),
         "cpu": {"temp": lhm["cpu_temp"], "load": lhm["cpu_load"]} if lhm is not None else None,
         "hotspot": lhm["gpu_hotspot"] if lhm else None,
         "gpu_mem": lhm["gpu_memory"] if lhm else None,
@@ -549,7 +569,13 @@ def build_lines(state: dict | None, show: dict, layout: str, cfg: dict, colors: 
                 parts.append([R(f"{g['power']:.0f}W", C["detail"])])
             rows.append(parts)
         else:
-            rows.append([[R("nvidia-smi not found", C["detail"])]])
+            if not state:
+                msg = "starting..."
+            elif state.get("gpu_problem") == "missing":
+                msg = "nvidia-smi not found"
+            else:
+                msg = "nvidia-smi not responding"
+            rows.append([[R(msg, C["detail"])]])
     temps = []
     if show.get("gpu_hotspot") and state.get("hotspot") is not None:
         v = state["hotspot"]
@@ -1862,7 +1888,7 @@ class Widget:
         self._open(LOG_FILE, "the log")
 
     def open_log_folder(self):
-        self._open(HERE, "the log folder")
+        self._open(LOG_FILE.parent, "the log folder")
 
     def open_history_folder(self):
         HISTORY_DIR.mkdir(exist_ok=True)
@@ -1981,6 +2007,8 @@ def single_instance(settings_path: Path):
 def main() -> None:
     ap = argparse.ArgumentParser(description=APP_NAME)
     ap.add_argument("--settings", help="path to a settings file (default: settings.json next to this script)")
+    ap.add_argument("--log", help="path to the log file (default: temp_widget.log next to the script, or next to "
+                                  "the --settings file when one is given)")
     ap.add_argument("--open-settings", nargs="?", const="general", choices=["general", "appearance"],
                     help="open the Settings window at startup (optionally on the given tab)")
     ap.add_argument("--test-crash", choices=["main", "thread", "tk"],
@@ -1994,6 +2022,7 @@ def main() -> None:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    configure_paths(path, Path(args.log).resolve() if args.log else None)
     handle = single_instance(path)
     if handle is None:
         log(f"another widget with the same settings is already running, exiting (v{VERSION})")
