@@ -1,0 +1,196 @@
+# SuperZydan Temp Widget
+
+A small always-on-top overlay for Windows that shows GPU, CPU and memory stats with a see-through background. It also serves the same readout as a web page you can add to Streamlabs or OBS as a browser source.
+
+It is one Python file that uses only the standard library (tkinter), so there is nothing to `pip install`.
+
+![Widget on a game-like background](screenshots/widget.png)
+
+White text with a thick black outline, purple labels, yellow for warm and red for hot. The yellow and red here are only showing because the warning limits were lowered for the screenshot.
+
+## What it shows
+
+- GPU temperature, fan, load and power draw (nvidia-smi)
+- GPU hotspot and GPU memory junction temperature (LibreHardwareMonitor, hidden if your card doesn't report them)
+- VRAM used / total (nvidia-smi)
+- CPU temperature and load (LibreHardwareMonitor)
+- System RAM used / total
+
+Every line can be switched off, separately for the desktop widget and the stream overlay.
+
+A compact one-line layout is available for the top of the screen:
+
+![Horizontal layout](screenshots/widget-horizontal.png)
+
+## Requirements
+
+- Windows 10 or 11
+- An NVIDIA GPU with the driver installed (the widget calls `nvidia-smi`)
+- Python 3 with tkinter. Tested on 3.11 and 3.13. The python.org installer includes tkinter.
+- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases) with its web server turned on, for CPU temperature and load and the GPU hotspot and memory temperatures
+
+Without LibreHardwareMonitor the widget still shows GPU temperature, fan, load, power, VRAM and RAM. The CPU lines show a short hint instead.
+
+## Setup
+
+1. Download or clone this repository somewhere permanent.
+2. Install LibreHardwareMonitor and start it. CPU temperatures need admin rights, so run it as administrator.
+3. In LibreHardwareMonitor open **Options > Remote Web Server** and tick **Run** (default port 8085). Also useful: **Run On Windows Startup** and **Start Minimized**.
+4. Double-click `Start-Temp-Widget.bat`. It finds Python through the `py` launcher or `pythonw` on your PATH and runs the widget without a console window.
+5. On the first run the widget creates `settings.json` next to the script (a copy of `settings.example.json`).
+
+Left-drag the widget to move it. Right-click it for the menu: Settings, layout, size, lock position, start with Windows, copy the overlay URL, test the alert hook, quit.
+
+To start it with Windows, use **Start with Windows** in the menu or the Settings window. That puts a small `.vbs` file in your Startup folder. Untick it to remove the file.
+
+If the widget is already running, starting it a second time does nothing.
+
+## Settings window
+
+Right-click the widget and pick **Settings...**. Changes apply right away and are saved to `settings.json`.
+
+![General settings](screenshots/settings-general.png)
+
+The **General** tab has:
+
+- which lines to show, with one column for the desktop widget and one for the stream overlay
+- layout (vertical or compact horizontal) and size, for each of them
+- refresh rate
+- warn and hot limits for each sensor (yellow at warn, red at hot)
+- alert hook on/off and a test button
+- stream overlay on/off, port, and a button that copies the URL
+- start with Windows, lock position
+
+The **Appearance** tab has:
+
+![Appearance settings](screenshots/settings-appearance.png)
+
+- colors for labels, values, secondary text, outline, warning and hot. Each one has a swatch, an editable hex code, the Windows color dialog, and an eyedropper. For the eyedropper, click **Eyedropper**, then click any pixel on any monitor. Esc or right-click cancels.
+- a font for the big numbers and one for the small text, picked from your installed fonts, with a live preview. `(auto)` uses Montserrat Black if you have it, then Segoe UI Black, Arial Black, Arial.
+- outline thickness from 0 (no outline) to 8 pixels
+- **Give the overlay its own colors and fonts**: when off, the overlay uses the desktop look. When on, switch the **Editing** option to Stream overlay to change the overlay separately.
+- **Reset appearance to default** puts the white, purple, yellow look back for whichever one you are editing.
+
+## Stream overlay (Streamlabs / OBS)
+
+The widget runs a tiny web server on `127.0.0.1` only (nothing else on your network can reach it). The default address is:
+
+```
+http://localhost:8086/overlay
+```
+
+In Streamlabs Desktop or OBS:
+
+1. Add a source, choose **Browser**.
+2. Paste the URL above. Leave the custom CSS alone, the page background is already transparent.
+3. Set a size that fits, for example 420 x 320 for the vertical layout. The horizontal layout needs a wide, short source, for example 1400 x 70.
+4. Drag it where you want it.
+
+![Stream overlay](screenshots/overlay.png)
+
+(The dark background in this picture is only there so the white text shows up. In the browser source it is transparent.)
+
+The widget has to be running for the overlay to work. The page keeps its last picture if the widget stops, and updates again when it comes back.
+
+You can adjust the page with URL options:
+
+| Option | Example | Does |
+| --- | --- | --- |
+| `layout` | `?layout=horizontal` | `vertical` or `horizontal` |
+| `size` | `?size=Large` | `Small`, `Medium` or `Large` |
+| `scale` | `?scale=1.5` | multiply everything by this |
+| `bg` | `?bg=%23222222` | solid background, for previewing in a normal browser tab |
+
+Which lines show, the default layout and size, and the overlay's colors and fonts come from `settings.json` (the `overlay` section).
+
+If port 8086 is taken by something else, change `overlay.port` in the Settings window or in `settings.json`. The widget keeps running without the overlay if it can't bind the port, and writes the reason to `temp_widget.log`.
+
+## settings.json
+
+`settings.json` is created on the first run and is not committed to git (it holds your window position and, if you set one, your alert command). `settings.example.json` shows every option with its default. Edit the file by hand while the widget runs and it reloads within a couple of seconds. A bad value falls back to the default.
+
+| Key | Meaning |
+| --- | --- |
+| `refresh_seconds` | how often sensors are read, 1 to 60 |
+| `layout` | `vertical` or `horizontal` |
+| `size` | `Small`, `Medium` or `Large` |
+| `x`, `y`, `locked` | window position, and whether dragging is disabled |
+| `colors` | `label`, `text` (values), `detail` (secondary text), `warn`, `hot`, `outline`, as `#RRGGBB` |
+| `fonts` | `big` and `small` font names, empty for automatic |
+| `outline_width` | outline thickness in pixels, 0 to 8 |
+| `show` | true/false for each line: `gpu_temp`, `gpu_details`, `gpu_hotspot`, `gpu_memory_temp`, `vram`, `cpu_temp`, `cpu_load`, `ram` |
+| `thresholds` | `warn` and `hot` for `gpu`, `gpu_hotspot`, `gpu_memory`, `cpu` (in °C) and `vram`, `ram` (in % used) |
+| `lhm_url` | LibreHardwareMonitor's data address, default `http://localhost:8085/data.json` |
+| `overlay` | `enabled`, `port`, `layout`, `size`, `scale`, `show`, and `own_appearance` with its own `colors`, `fonts` and `outline_width` |
+| `alerts` | see below |
+
+## Alert hook
+
+The widget can run a command when a temperature is high enough to be a real problem. It is meant for things like a sound, a notification or a voice announcement, not for every warm reading.
+
+Defaults in `settings.example.json`:
+
+| Sensor (`id`) | Critical temp |
+| --- | --- |
+| GPU core (`gpu`) | 88 °C |
+| GPU hotspot (`gpu_hotspot`) | 100 °C |
+| GPU memory junction (`gpu_memory`) | 100 °C |
+| CPU package (`cpu`) | 100 °C |
+
+The rules:
+
+- The sensor has to stay at or above its critical temp for `hold_seconds` (default 10) without dipping below. A short spike does nothing.
+- After it fires, that sensor stays quiet for `cooldown_seconds` (default 300, so 5 minutes). Each sensor has its own cooldown.
+- Set a sensor's value to `null` (or 0) to turn that one off. `"enabled": false` turns all of it off.
+- `alerts.command` is empty by default, so nothing runs until you set it. Alerts are still written to `temp_widget.log`.
+
+`alerts.command` can be a list (recommended, no quoting problems) or a single string. These placeholders are replaced:
+
+| Placeholder | Value |
+| --- | --- |
+| `{sensor}` | `gpu`, `gpu_hotspot`, `gpu_memory` or `cpu` |
+| `{label}` | `GPU core`, `GPU hotspot`, `GPU memory` or `CPU package` |
+| `{temp}` | the temperature, rounded, for example `102` |
+| `{threshold}` | the critical temp that was crossed |
+
+The same values are also set as environment variables: `TEMPWIDGET_SENSOR`, `TEMPWIDGET_LABEL`, `TEMPWIDGET_TEMP`, `TEMPWIDGET_THRESHOLD`.
+
+The command is started directly, not through `cmd.exe`, with no window. Example that makes Windows speak the alert:
+
+```json
+"alerts": {
+  "enabled": true,
+  "command": [
+    "powershell", "-NoProfile", "-Command",
+    "Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{label} is at {temp} degrees')"
+  ],
+  "hold_seconds": 10,
+  "cooldown_seconds": 300,
+  "critical": { "gpu": 88, "gpu_hotspot": 100, "gpu_memory": 100, "cpu": 100 }
+}
+```
+
+Use **Test alert hook** in the right-click menu (or **Test alert** in Settings) to run the command once with made-up values. The command comes from your own `settings.json`, so only put commands there that you trust.
+
+## Files
+
+| File | What |
+| --- | --- |
+| `temp_widget.py` | the widget |
+| `Start-Temp-Widget.bat` | launcher, finds Python and starts the widget |
+| `settings.example.json` | all options with defaults |
+| `temp_widget.ico` | icon for shortcuts |
+| `settings.json` | your settings, created on first run |
+| `temp_widget.log` | alerts and errors, created when needed |
+
+To make a desktop shortcut, create one to `Start-Temp-Widget.bat` and pick `temp_widget.ico` as its icon.
+
+## Notes
+
+- Only NVIDIA GPUs are read through nvidia-smi. Hotspot and memory temps come from LibreHardwareMonitor, so they show up for any card it supports.
+- Temperatures are in °C.
+- Command line options: `--settings <file>` uses a different settings file (and allows a second widget), `--open-settings [general|appearance]` opens the Settings window on start.
+
+## License
+
+MIT, see `LICENSE`.

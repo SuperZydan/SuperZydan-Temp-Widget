@@ -1,0 +1,101 @@
+{
+  "refresh_seconds": 2,
+  "layout": "vertical",
+  "size": "Medium",
+  "x": 40,
+  "y": 40,
+  "locked": false,
+  "colors": {
+    "label": "#B266FF",
+    "text": "#FFFFFF",
+    "detail": "#D8D8D8",
+    "warn": "#FFD400",
+    "hot": "#FF3B3B",
+    "outline": "#000000"
+  },
+  "fonts": {
+    "big": "",
+    "small": ""
+  },
+  "outline_width": 2,
+  "show": {
+    "gpu_temp": true,
+    "gpu_details": true,
+    "gpu_hotspot": true,
+    "gpu_memory_temp": true,
+    "vram": true,
+    "cpu_temp": true,
+    "cpu_load": true,
+    "ram": true
+  },
+  "thresholds": {
+    "gpu": {
+      "warn": 75,
+      "hot": 85
+    },
+    "gpu_hotspot": {
+      "warn": 85,
+      "hot": 95
+    },
+    "gpu_memory": {
+      "warn": 90,
+      "hot": 100
+    },
+    "cpu": {
+      "warn": 85,
+      "hot": 95
+    },
+    "vram": {
+      "warn": 85,
+      "hot": 95
+    },
+    "ram": {
+      "warn": 85,
+      "hot": 95
+    }
+  },
+  "lhm_url": "http://localhost:8085/data.json",
+  "overlay": {
+    "enabled": true,
+    "port": 8086,
+    "layout": "vertical",
+    "size": "Medium",
+    "scale": 1.0,
+    "show": {
+      "gpu_temp": true,
+      "gpu_details": true,
+      "gpu_hotspot": true,
+      "gpu_memory_temp": true,
+      "vram": true,
+      "cpu_temp": true,
+      "cpu_load": true,
+      "ram": true
+    },
+    "own_appearance": false,
+    "colors": {
+      "label": "#B266FF",
+      "text": "#FFFFFF",
+      "detail": "#D8D8D8",
+      "warn": "#FFD400",
+      "hot": "#FF3B3B",
+      "outline": "#000000"
+    },
+    "fonts": {
+      "big": "",
+      "small": ""
+    },
+    "outline_width": 2
+  },
+  "alerts": {
+    "enabled": true,
+    "command": "",
+    "hold_seconds": 10,
+    "cooldown_seconds": 300,
+    "critical": {
+      "gpu": 88,
+      "gpu_hotspot": 100,
+      "gpu_memory": 100,
+      "cpu": 100
+    }
+  }
+}

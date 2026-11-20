@@ -1,0 +1,12 @@
+# your own settings (window position, alert command)
+settings.json
+settings.json.tmp
+*.json.tmp
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+*.log
+*.log.old
