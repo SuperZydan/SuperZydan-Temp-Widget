@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import ctypes
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.request
@@ -39,6 +42,9 @@ LOG_FILE = HERE / "temp_widget.log"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 KEY = "#010101"  # this exact color becomes see-through
 APP_NAME = "Temp Widget"
+VERSION = "1.1"
+HISTORY_DIR = HERE / "history"
+DEBUG = False  # set from settings: logging.debug
 
 SIZES = {"Small": (18, 10), "Medium": (26, 12), "Large": (36, 15)}
 LAYOUTS = ("vertical", "horizontal")
@@ -92,6 +98,8 @@ DEFAULTS: dict = {
         "ram": {"warn": 85, "hot": 95},
     },
     "lhm_url": "http://localhost:8085/data.json",
+    "history": {"enabled": False},   # one CSV row a minute in history/YYYY-MM.csv
+    "logging": {"debug": False},     # extra detail in temp_widget.log
     "overlay": {
         "enabled": True,
         "port": 8086,
@@ -124,14 +132,90 @@ ALERT_SENSORS = [
 
 # ---------------------------------------------------------------- logging
 
-def log(msg: str) -> None:
+_log_lock = threading.Lock()
+
+
+def log(msg: str, level: str = "INFO") -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {level:<5} {msg}\n"
     try:
-        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 200_000:
-            LOG_FILE.replace(LOG_FILE.with_suffix(".log.old"))
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+        with _log_lock:
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > 500_000:
+                LOG_FILE.replace(LOG_FILE.with_suffix(".log.old"))
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(line)
     except OSError:
         pass
+
+
+def dlog(msg: str) -> None:
+    """Extra detail, only written when logging.debug is on."""
+    if DEBUG:
+        log(msg, "DEBUG")
+
+
+def apply_logging(cfg: dict) -> None:
+    global DEBUG
+    DEBUG = bool(cfg["logging"]["debug"])
+
+
+def log_exc(where: str, exc_info=None) -> None:
+    """Writes the full traceback of the exception being handled (or of exc_info)."""
+    info = exc_info or sys.exc_info()
+    tb = "".join(traceback.format_exception(*info)).rstrip()
+    log(f"{where}\n{tb}", "ERROR")
+
+
+def install_exception_hooks() -> None:
+    """Nothing the widget does can fail silently: main thread, other threads (and Tk callbacks,
+    see Widget.__init__) all end up in temp_widget.log with a full traceback."""
+    def main_hook(t, v, tb):
+        log_exc("Unhandled exception in the main thread", (t, v, tb))
+
+    def thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread else "?"
+        log_exc(f"Unhandled exception in thread '{name}'", (args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = main_hook
+    threading.excepthook = thread_hook
+
+
+SOURCE_ERR: dict[str, str] = {}   # last failure reason per source, used for the "stopped responding" log line
+
+
+def gpu_name() -> str | None:
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=5, creationflags=NO_WINDOW).stdout.strip()
+        if out:
+            name, _, driver = out.splitlines()[0].partition(",")
+            return f"{name.strip()} (driver {driver.strip()})"
+    except Exception:
+        pass
+    return None
+
+
+def startup_report(settings_path: Path, cfg: dict) -> None:
+    log(f"=== Temp Widget v{VERSION} starting ===")
+    log(f"Python {platform.python_version()} ({sys.executable}), {platform.platform()}")
+    log(f"settings file: {settings_path}")
+    exe = shutil.which("nvidia-smi")
+    name = gpu_name() if exe else None
+    log(f"nvidia-smi: {'found at ' + exe if exe else 'NOT found on PATH (GPU lines will be empty)'}")
+    if exe:
+        log(f"GPU: {name or 'nvidia-smi did not answer'}")
+    lhm = read_lhm(cfg["lhm_url"])
+    if lhm is None:
+        log(f"LibreHardwareMonitor: NOT reachable at {cfg['lhm_url']} ({SOURCE_ERR.get('lhm', 'unknown reason')}). "
+            f"CPU, hotspot and memory-junction lines stay empty until it is running.", "WARN")
+    else:
+        have = [n for n, k in (("CPU temp", "cpu_temp"), ("CPU load", "cpu_load"), ("GPU hotspot", "gpu_hotspot"),
+                               ("GPU memory junction", "gpu_memory")) if lhm.get(k) is not None]
+        log(f"LibreHardwareMonitor: reachable at {cfg['lhm_url']}; sensors found: {', '.join(have) or 'none'}")
+    log(f"history recording: {'on' if cfg['history']['enabled'] else 'off'}; "
+        f"alerts: {'on' if cfg['alerts']['enabled'] else 'off'}, "
+        f"command {'set' if cfg['alerts']['command'] else 'not set'}; debug logging: {'on' if DEBUG else 'off'}")
 
 
 # ---------------------------------------------------------------- settings
@@ -221,6 +305,12 @@ def sanitize(cfg: dict) -> dict:
         crit[sid] = None if v is None else _num(v, d["alerts"]["critical"][sid], 0, 200)
     al["critical"] = crit
     cfg["alerts"] = al
+    hist = cfg.get("history") if isinstance(cfg.get("history"), dict) else {}
+    hist["enabled"] = bool(hist.get("enabled", False))
+    cfg["history"] = hist
+    lg = cfg.get("logging") if isinstance(cfg.get("logging"), dict) else {}
+    lg["debug"] = bool(lg.get("debug", False))
+    cfg["logging"] = lg
     return cfg
 
 
@@ -261,6 +351,7 @@ class Settings:
             return False
         merged = deep_merge(copy.deepcopy(DEFAULTS), raw)
         self.data = sanitize(merged)
+        apply_logging(self.data)
         self._stamp()
         return True
 
@@ -269,8 +360,8 @@ class Settings:
             tmp = self.path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
             os.replace(tmp, self.path)
-        except OSError as e:
-            log(f"could not save settings.json: {e}")
+        except OSError:
+            log_exc("could not save settings.json")
         self._stamp()
 
     def changed_on_disk(self) -> bool:
@@ -291,21 +382,27 @@ def num(text):
 
 def read_gpu() -> dict | None:
     try:
-        out = subprocess.run(
+        proc = subprocess.run(
             ["nvidia-smi",
              "--query-gpu=temperature.gpu,fan.speed,utilization.gpu,power.draw,memory.used,memory.total",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5, creationflags=NO_WINDOW,
-        ).stdout.strip().splitlines()
+        )
+        out = proc.stdout.strip().splitlines()
         if not out:
+            SOURCE_ERR["nvidia"] = f"no output, exit code {proc.returncode} {proc.stderr.strip()[:200]}".strip()
             return None
         t, fan, load, power, vu, vt = [p.strip() for p in out[0].split(",")]
         vu, vt = num(vu), num(vt)
+        SOURCE_ERR.pop("nvidia", None)
         return {"temp": num(t), "fan": num(fan), "load": num(load), "power": num(power),
                 "vram_used": vu / 1024 if vu is not None else None,
                 "vram_total": vt / 1024 if vt is not None else None}
-    except Exception:
-        return None
+    except FileNotFoundError:
+        SOURCE_ERR["nvidia"] = "nvidia-smi not found on PATH"
+    except Exception as e:
+        SOURCE_ERR["nvidia"] = f"{type(e).__name__}: {e}"
+    return None
 
 
 class _MemStatus(ctypes.Structure):
@@ -389,8 +486,10 @@ def read_lhm(url: str) -> dict | None:
     try:
         with urllib.request.urlopen(url, timeout=2) as r:
             tree = json.loads(r.read().decode("utf-8", "replace"))
+        SOURCE_ERR.pop("lhm", None)
         return parse_lhm(tree)
-    except Exception:
+    except Exception as e:
+        SOURCE_ERR["lhm"] = f"{type(e).__name__}: {e}"
         return None
 
 
@@ -650,10 +749,130 @@ def run_alert_command(cfg: dict, sensor: str, label: str, temp: float, threshold
                TEMPWIDGET_TEMP=f"{temp:.0f}", TEMPWIDGET_THRESHOLD=f"{threshold:.0f}")
     log(f"ALERT {label} {temp:.0f}C (threshold {threshold:.0f}C): running alert command")
     try:
-        subprocess.Popen(args, env=env, cwd=str(HERE), creationflags=NO_WINDOW,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        log(f"alert command failed to start: {e}")
+        proc = subprocess.Popen(args, env=env, cwd=str(HERE), creationflags=NO_WINDOW,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except Exception:
+        log_exc("alert command failed to start")
+        return
+    dlog(f"alert command started (pid {proc.pid}): {args}")
+    try:
+        _, err = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        log(f"alert command (pid {proc.pid}) still running after 60 s, leaving it alone", "WARN")
+        return
+    if proc.returncode:
+        log(f"alert command exited with code {proc.returncode}: "
+            f"{(err or b'').decode('utf-8', 'replace').strip()[:300]}", "WARN")
+    else:
+        dlog("alert command finished with exit code 0")
+
+
+# ---------------------------------------------------------------- history and peaks
+
+def readings_from(st: dict) -> dict:
+    """The four temperatures the alert hook, the peaks window and the history file care about."""
+    g = st.get("gpu") or {}
+    cpu = st.get("cpu") or {}
+    return {"gpu": g.get("temp"), "gpu_hotspot": st.get("hotspot"),
+            "gpu_memory": st.get("gpu_mem"), "cpu": cpu.get("temp")}
+
+
+class History:
+    """Appends one CSV row a minute to history/YYYY-MM.csv (a new file each month)."""
+
+    COLUMNS = ["time", "gpu_c", "gpu_hotspot_c", "gpu_memory_c", "cpu_c", "vram_used_gb", "ram_used_gb"]
+
+    def __init__(self, folder: Path):
+        self.folder = folder
+        self.last = 0.0
+        self.failed = False
+
+    def maybe_write(self, st: dict, now: float) -> None:
+        if now - self.last < 60:
+            return
+        self.last = now
+        r = readings_from(st)
+        g, ram = st.get("gpu") or {}, st.get("ram") or {}
+
+        def f(v):
+            return "" if v is None else f"{v:.1f}"
+
+        row = [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), f(r["gpu"]), f(r["gpu_hotspot"]),
+               f(r["gpu_memory"]), f(r["cpu"]), f(g.get("vram_used")), f(ram.get("used"))]
+        path = self.folder / time.strftime("%Y-%m.csv", time.localtime(now))
+        try:
+            self.folder.mkdir(exist_ok=True)
+            new = not path.exists() or path.stat().st_size == 0
+            with path.open("a", encoding="utf-8", newline="") as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(self.COLUMNS)
+                w.writerow(row)
+            if self.failed:
+                log("history: writing works again")
+                self.failed = False
+            dlog(f"history row written to {path.name}")
+        except OSError as e:
+            if not self.failed:                       # one line per outage, not one per minute
+                log(f"history: cannot write {path}: {e}", "WARN")
+            self.failed = True
+
+
+class PeakTracker:
+    """Highest temperature seen per sensor, for this session and for today, with the time it happened."""
+
+    def __init__(self, now: float | None = None):
+        self.lock = threading.Lock()
+        self.started = now if now is not None else time.time()
+        self.session: dict[str, tuple[float, float]] = {}
+        self.today: dict[str, tuple[float, float]] = {}
+        self.day = time.strftime("%Y-%m-%d", time.localtime(self.started))
+
+    def update(self, readings: dict, now: float) -> None:
+        with self.lock:
+            day = time.strftime("%Y-%m-%d", time.localtime(now))
+            if day != self.day:
+                self.day, self.today = day, {}
+            for sid, v in readings.items():
+                if v is None:
+                    continue
+                for d in (self.session, self.today):
+                    cur = d.get(sid)
+                    if cur is None or v > cur[0]:
+                        d[sid] = (v, now)
+
+    def seed_today(self, folder: Path) -> int:
+        """Earlier rows from today's history file (the widget may have been restarted). Returns rows used."""
+        path = folder / time.strftime("%Y-%m.csv")
+        used = 0
+        try:
+            with path.open(encoding="utf-8", newline="") as fh, self.lock:
+                for row in csv.DictReader(fh):
+                    stamp = row.get("time", "")
+                    if not stamp.startswith(self.day):
+                        continue
+                    when = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+                    used += 1
+                    for sid, col in (("gpu", "gpu_c"), ("gpu_hotspot", "gpu_hotspot_c"),
+                                     ("gpu_memory", "gpu_memory_c"), ("cpu", "cpu_c")):
+                        try:
+                            v = float(row.get(col) or "")
+                        except ValueError:
+                            continue
+                        cur = self.today.get(sid)
+                        if cur is None or v > cur[0]:
+                            self.today[sid] = (v, when)
+        except (OSError, ValueError, csv.Error):
+            pass
+        return used
+
+    def reset_session(self, now: float) -> None:
+        with self.lock:
+            self.session, self.started = {}, now
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.session), dict(self.today), self.started
 
 
 # ---------------------------------------------------------------- stream overlay
@@ -738,8 +957,8 @@ class OverlayServer:
         app = self.app
 
         class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *a):
-                pass
+            def log_message(self, fmt, *a):
+                dlog("overlay request: " + (fmt % a))
 
             def _send(self, code, body: bytes, ctype: str):
                 self.send_response(code)
@@ -760,14 +979,15 @@ class OverlayServer:
                 if u.path == "/overlay/state":
                     try:
                         body = json.dumps(app.overlay_payload(parse_qs(u.query))).encode("utf-8")
-                    except Exception as e:
-                        log(f"overlay error: {e}")
+                    except Exception:
+                        log_exc("overlay: building the page data failed")
                         return self._send(500, b"{}", "application/json")
                     return self._send(200, body, "application/json; charset=utf-8")
                 self._send(404, b"not found", "text/plain")
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
+            allow_reuse_address = False   # on Windows, reuse would let a second widget silently share the port
 
         try:
             self.httpd = Server(("127.0.0.1", port), Handler)
@@ -777,7 +997,7 @@ class OverlayServer:
             log(f"overlay could not start on {self.error}")
             return False
         self.port, self.error = port, ""
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=self.httpd.serve_forever, name="overlay", daemon=True).start()
         log(f"overlay at http://localhost:{port}/overlay")
         return True
 
@@ -905,6 +1125,60 @@ FG, MUTED = "#EDEAF5", "#9a93ad"
 PURPLE, YELLOW = "#B266FF", "#FFD400"
 
 
+_STYLED = False
+
+
+def setup_style(w) -> None:
+    """Dark purple/yellow ttk theme, shared by the Settings and Peak temps windows."""
+    global _STYLED
+    if _STYLED:
+        return
+    _STYLED = True
+    st = ttk.Style(w)
+    st.theme_use("clam")
+    st.configure(".", background=BG, foreground=FG, fieldbackground=FIELD, bordercolor=FIELD,
+                 lightcolor=FIELD, darkcolor=FIELD, troughcolor=FIELD, focuscolor=BG)
+    st.configure("TFrame", background=BG)
+    st.configure("Card.TFrame", background=PANEL)
+    st.configure("TLabel", background=PANEL, foreground=FG, font=("Segoe UI", 10))
+    st.configure("Muted.TLabel", foreground=MUTED, font=("Segoe UI", 9))
+    st.configure("Head.TLabel", foreground=PURPLE, font=("Segoe UI Semibold", 11))
+    st.configure("Title.TLabel", background=BG, foreground=YELLOW, font=("Segoe UI Semibold", 14))
+    st.configure("Ver.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 10))
+    st.configure("TCheckbutton", background=PANEL, foreground=FG, font=("Segoe UI", 10),
+                 indicatorbackground=FIELD, indicatorforeground=BG, indicatorcolor=FIELD,
+                 upperbordercolor=PURPLE, lowerbordercolor=PURPLE)
+    st.map("TCheckbutton", background=[("active", PANEL)],
+           indicatorcolor=[("selected", YELLOW), ("pressed", PURPLE)],
+           indicatorbackground=[("selected", YELLOW)],
+           foreground=[("active", YELLOW)])
+    st.configure("TCombobox", arrowcolor=PURPLE, selectbackground=FIELD, selectforeground=FG,
+                 padding=3)
+    st.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)],
+           selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)])
+    st.configure("TSpinbox", arrowcolor=PURPLE, padding=3)
+    st.configure("TEntry", padding=3)
+    st.configure("TButton", background=PURPLE, foreground="#14101c", bordercolor=PURPLE,
+                 font=("Segoe UI Semibold", 10), padding=(10, 4))
+    st.map("TButton", background=[("active", YELLOW), ("pressed", YELLOW)])
+    st.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(16, 6, 16, 0))
+    st.configure("TNotebook.Tab", background=BG, foreground=MUTED, padding=(18, 6),
+                 font=("Segoe UI Semibold", 10), borderwidth=0)
+    st.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", YELLOW)])
+    st.configure("TRadiobutton", background=PANEL, foreground=FG, font=("Segoe UI", 10),
+                 indicatorbackground=FIELD, indicatorforeground=YELLOW)
+    st.map("TRadiobutton", background=[("active", PANEL)], indicatorcolor=[("selected", YELLOW)],
+           indicatorbackground=[("selected", FIELD)], foreground=[("active", YELLOW), ("disabled", MUTED)])
+    st.configure("Horizontal.TScale", background=PURPLE, troughcolor=FIELD, bordercolor=FIELD,
+                 lightcolor=PURPLE, darkcolor=PURPLE)
+    st.map("Horizontal.TScale", background=[("active", YELLOW)], lightcolor=[("active", YELLOW)],
+           darkcolor=[("active", YELLOW)])
+    w.option_add("*TCombobox*Listbox.background", FIELD)
+    w.option_add("*TCombobox*Listbox.foreground", FG)
+    w.option_add("*TCombobox*Listbox.selectBackground", PURPLE)
+    w.option_add("*TCombobox*Listbox.selectForeground", "#14101c")
+
+
 class SettingsWindow(tk.Toplevel):
     def __init__(self, app: "Widget"):
         super().__init__(app.root)
@@ -928,48 +1202,7 @@ class SettingsWindow(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
 
     def _style(self):
-        st = ttk.Style(self)
-        st.theme_use("clam")
-        st.configure(".", background=BG, foreground=FG, fieldbackground=FIELD, bordercolor=FIELD,
-                     lightcolor=FIELD, darkcolor=FIELD, troughcolor=FIELD, focuscolor=BG)
-        st.configure("TFrame", background=BG)
-        st.configure("Card.TFrame", background=PANEL)
-        st.configure("TLabel", background=PANEL, foreground=FG, font=("Segoe UI", 10))
-        st.configure("Muted.TLabel", foreground=MUTED, font=("Segoe UI", 9))
-        st.configure("Head.TLabel", foreground=PURPLE, font=("Segoe UI Semibold", 11))
-        st.configure("Title.TLabel", background=BG, foreground=YELLOW, font=("Segoe UI Semibold", 14))
-        st.configure("TCheckbutton", background=PANEL, foreground=FG, font=("Segoe UI", 10),
-                     indicatorbackground=FIELD, indicatorforeground=BG, indicatorcolor=FIELD,
-                     upperbordercolor=PURPLE, lowerbordercolor=PURPLE)
-        st.map("TCheckbutton", background=[("active", PANEL)],
-               indicatorcolor=[("selected", YELLOW), ("pressed", PURPLE)],
-               indicatorbackground=[("selected", YELLOW)],
-               foreground=[("active", YELLOW)])
-        st.configure("TCombobox", arrowcolor=PURPLE, selectbackground=FIELD, selectforeground=FG,
-                     padding=3)
-        st.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)],
-               selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)])
-        st.configure("TSpinbox", arrowcolor=PURPLE, padding=3)
-        st.configure("TEntry", padding=3)
-        st.configure("TButton", background=PURPLE, foreground="#14101c", bordercolor=PURPLE,
-                     font=("Segoe UI Semibold", 10), padding=(10, 4))
-        st.map("TButton", background=[("active", YELLOW), ("pressed", YELLOW)])
-        st.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(16, 6, 16, 0))
-        st.configure("TNotebook.Tab", background=BG, foreground=MUTED, padding=(18, 6),
-                     font=("Segoe UI Semibold", 10), borderwidth=0)
-        st.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", YELLOW)])
-        st.configure("TRadiobutton", background=PANEL, foreground=FG, font=("Segoe UI", 10),
-                     indicatorbackground=FIELD, indicatorforeground=YELLOW)
-        st.map("TRadiobutton", background=[("active", PANEL)], indicatorcolor=[("selected", YELLOW)],
-               indicatorbackground=[("selected", FIELD)], foreground=[("active", YELLOW), ("disabled", MUTED)])
-        st.configure("Horizontal.TScale", background=PURPLE, troughcolor=FIELD, bordercolor=FIELD,
-                     lightcolor=PURPLE, darkcolor=PURPLE)
-        st.map("Horizontal.TScale", background=[("active", YELLOW)], lightcolor=[("active", YELLOW)],
-               darkcolor=[("active", YELLOW)])
-        self.option_add("*TCombobox*Listbox.background", FIELD)
-        self.option_add("*TCombobox*Listbox.foreground", FG)
-        self.option_add("*TCombobox*Listbox.selectBackground", PURPLE)
-        self.option_add("*TCombobox*Listbox.selectForeground", "#14101c")
+        setup_style(self)
 
     # -- small builders
     def _card(self, parent, title):
@@ -1030,8 +1263,10 @@ class SettingsWindow(tk.Toplevel):
     def _build(self):
         a, s = self.app, self.app.settings
         d = lambda *p: self._get(*p)  # noqa: E731
-        ttk.Label(self, text=f"{APP_NAME} settings", style="Title.TLabel").grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 4))
+        head = ttk.Frame(self)
+        head.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 4))
+        ttk.Label(head, text=f"{APP_NAME} settings", style="Title.TLabel").pack(side="left")
+        ttk.Label(head, text=f"v{VERSION}", style="Ver.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
 
         self.nb = nb = ttk.Notebook(self)
         nb.grid(row=1, column=0, columnspan=2, sticky="nsew")
@@ -1064,10 +1299,24 @@ class SettingsWindow(tk.Toplevel):
                     lambda v: a.set_value(("overlay", "size"), v), r + 1, 2)
         ttk.Label(left, text="Compact horizontal = one line, for the top of the screen.",
                   style="Muted.TLabel").grid(row=r + 2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        left.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=8)
+        left.grid(row=0, column=0, sticky="new", padx=(16, 8), pady=8)
+
+        logc = self._card(gtab, "Logging and history")
+        self._check(logc, "Record temperature history (one row a minute)", "history.enabled",
+                    lambda: d("history", "enabled"), lambda v: a.set_value(("history", "enabled"), v),
+                    1, 0, columnspan=2)
+        self._check(logc, "Debug logging (extra detail in the log)", "logging.debug",
+                    lambda: d("logging", "debug"), lambda v: a.set_value(("logging", "debug"), v),
+                    2, 0, columnspan=2, pady=(4, 8))
+        ttk.Button(logc, text="Peak temps...", command=a.open_peaks).grid(row=3, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Button(logc, text="Open log", command=a.open_log).grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=2)
+        ttk.Button(logc, text="Open log folder", command=a.open_log_folder).grid(row=4, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Button(logc, text="Open history folder", command=a.open_history_folder).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=2)
+        logc.columnconfigure((0, 1), weight=1)
+        logc.grid(row=1, column=0, sticky="new", padx=(16, 8), pady=(0, 8))
 
         right = ttk.Frame(gtab)
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=8)
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(8, 16), pady=8)
 
         # ----- refresh + thresholds
         th = self._card(right, "Refresh and colors")
@@ -1330,6 +1579,79 @@ class SettingsWindow(tk.Toplevel):
         self.destroy()
 
 
+class PeaksWindow(tk.Toplevel):
+    """Highest temperatures this session and today, and when each happened."""
+
+    def __init__(self, app: "Widget"):
+        super().__init__(app.root)
+        self.app = app
+        self.title(f"{APP_NAME} peak temps")
+        self.configure(bg=BG)
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        setup_style(self)
+        ttk.Label(self, text="Peak temps", style="Title.TLabel").grid(row=0, column=0, sticky="w", padx=16, pady=(12, 4))
+        card = ttk.Frame(self, style="Card.TFrame", padding=(14, 10))
+        card.grid(row=1, column=0, sticky="ew", padx=16, pady=6)
+        for c, text in enumerate(("", "This session", "at", "Today", "at")):
+            ttk.Label(card, text=text, style="Muted.TLabel").grid(row=0, column=c, sticky="w", padx=(0, 18), pady=(0, 4))
+        self.cells: dict[str, list[tk.Label]] = {}
+        for r, (sid, label) in enumerate(ALERT_SENSORS, start=1):
+            ttk.Label(card, text=label).grid(row=r, column=0, sticky="w", padx=(0, 18), pady=3)
+            cells = []
+            for c in range(1, 5):
+                lab = tk.Label(card, text="-", bg=PANEL, fg=FG, font=("Segoe UI Semibold" if c in (1, 3) else "Segoe UI", 10),
+                               anchor="w", width=10 if c in (1, 3) else 13)
+                lab.grid(row=r, column=c, sticky="w", padx=(0, 18), pady=3)
+                cells.append(lab)
+            self.cells[sid] = cells
+        self.note = ttk.Label(self, text="", style="Ver.TLabel", wraplength=470, justify="left")
+        self.note.grid(row=2, column=0, sticky="w", padx=18, pady=(2, 6))
+        bar = ttk.Frame(self)
+        bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(4, 14))
+        ttk.Button(bar, text="Reset session", command=self.reset).pack(side="left")
+        ttk.Button(bar, text="Close", command=self.close).pack(side="right")
+        self._job = None
+        self.refresh()
+        self.update_idletasks()
+        x = min(max(0, app.root.winfo_x() + 60), max(0, self.winfo_screenwidth() - self.winfo_reqwidth() - 20))
+        y = min(max(0, app.root.winfo_y() + 60), max(0, self.winfo_screenheight() - self.winfo_reqheight() - 60))
+        self.geometry(f"+{x}+{y}")
+
+    @staticmethod
+    def when(ts: float) -> str:
+        t = time.localtime(ts)
+        same_day = time.strftime("%Y-%m-%d", t) == time.strftime("%Y-%m-%d")
+        return time.strftime("%H:%M:%S" if same_day else "%b %d %H:%M", t)
+
+    def refresh(self):
+        session, today, started = self.app.peaks.snapshot()
+        s = self.app.settings.data
+        for sid, cells in self.cells.items():
+            for (peaks, vc, wc) in ((session, cells[0], cells[1]), (today, cells[2], cells[3])):
+                if sid in peaks:
+                    v, ts = peaks[sid]
+                    vc.configure(text=f"{v:.0f}\u00b0C", fg=level_color(v, s["thresholds"][sid], s["colors"]))
+                    wc.configure(text=self.when(ts))
+                else:
+                    vc.configure(text="-", fg=FG)
+                    wc.configure(text="")
+        self.note.configure(text=f"Session started {self.when(started)}. Today's peaks also use earlier rows from "
+                                 f"the history file if it was recording.")
+        self._job = self.after(1000, self.refresh)
+
+    def reset(self):
+        self.app.peaks.reset_session(time.time())
+        self.refresh()
+
+    def close(self):
+        if self._job:
+            self.after_cancel(self._job)
+        self.app.peaks_win = None
+        self.destroy()
+
+
 # ---------------------------------------------------------------- the widget
 
 class Widget:
@@ -1338,12 +1660,18 @@ class Widget:
         self.settings_win: SettingsWindow | None = None
         self.state: dict | None = None
         self.alerts = AlertEngine()
+        self.peaks = PeakTracker()
+        self.peaks_win: PeaksWindow | None = None
+        self.history = History(HISTORY_DIR)
+        self._src: dict[str, bool] = {}
+        self._hist_on = False
         self.wake = threading.Event()
         self._last_draw = None
         self._last_check = 0.0
         self._dx = self._dy = 0
 
         self.root = tk.Tk()
+        self.root.report_callback_exception = lambda t, v, tb: log_exc("Unhandled exception in a Tk callback", (t, v, tb))
         self.root.title(APP_NAME)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -1367,7 +1695,7 @@ class Widget:
         self.overlay = OverlayServer(self)
         self.apply_overlay()
 
-        threading.Thread(target=self.poll, daemon=True).start()
+        threading.Thread(target=self.poll, name="poll", daemon=True).start()
         self.redraw()
         self.root.after(500, self.tick)
 
@@ -1377,26 +1705,65 @@ class Widget:
 
     # ---------- data
     def poll(self):
+        try:
+            startup_report(self.settings.path, self.s)
+            rows = self.peaks.seed_today(HISTORY_DIR)
+            if rows:
+                log(f"peaks: seeded today's peaks from {rows} history rows")
+        except Exception:
+            log_exc("startup report failed")
         while True:
             try:
+                t0 = time.time()
                 st = collect(self.s)
                 self.state = st
+                self.track_sources(st)
+                self.peaks.update(readings_from(st), t0)
+                self.record_history(st, t0)
                 self.check_alerts(st)
-            except Exception as e:
-                log(f"poll error: {e}")
+                dlog(f"poll took {(time.time() - t0) * 1000:.0f} ms: " + ", ".join(
+                    f"{k}={'-' if v is None else format(v, '.0f')}" for k, v in readings_from(st).items()))
+            except Exception:
+                log_exc("poll failed")
             self.wake.wait(self.s["refresh_seconds"])
             self.wake.clear()
 
+    def track_sources(self, st: dict):
+        """One log line when a source goes away or comes back, nothing while it stays the same."""
+        for name, key, ok in (("nvidia-smi", "nvidia", st["gpu"] is not None),
+                              ("LibreHardwareMonitor", "lhm", st["cpu"] is not None)):
+            prev = self._src.get(name)
+            self._src[name] = ok
+            if prev is None or prev == ok:
+                continue          # first reading is covered by the startup report
+            if ok:
+                log(f"{name}: working again")
+            else:
+                log(f"{name}: stopped responding ({SOURCE_ERR.get(key, 'unknown reason')})", "WARN")
+
+    def record_history(self, st: dict, now: float):
+        on = self.s["history"]["enabled"]
+        if on != self._hist_on:
+            self._hist_on = on
+            log(f"history recording {'on' if on else 'off'}" + (f" -> {HISTORY_DIR}" if on else ""))
+            self.history.last = 0.0           # a row right away when it is switched on
+        if on:
+            self.history.maybe_write(st, now)
+
     def check_alerts(self, st: dict):
-        g = st.get("gpu") or {}
-        cpu = st.get("cpu") or {}
-        readings = {"gpu": g.get("temp"), "gpu_hotspot": st.get("hotspot"),
-                    "gpu_memory": st.get("gpu_mem"), "cpu": cpu.get("temp")}
-        for sid, label, t, thr in self.alerts.update(readings, self.s, time.time()):
-            threading.Thread(target=run_alert_command, args=(self.s, sid, label, t, thr), daemon=True).start()
+        readings = readings_from(st)
+        now = time.time()
+        for sid, label, t, thr in self.alerts.update(readings, self.s, now):
+            threading.Thread(target=run_alert_command, args=(self.s, sid, label, t, thr),
+                             name="alert-command", daemon=True).start()
+        if DEBUG:
+            for sid, since in list(self.alerts.since.items()):
+                dlog(f"alert watch: {sid} at/above critical for {now - since:.0f} s "
+                     f"(needs {self.s['alerts']['hold_seconds']:.0f} s)")
 
     def test_alert(self):
-        threading.Thread(target=run_alert_command, args=(self.s, "test", "test alert", 99, 88), daemon=True).start()
+        threading.Thread(target=run_alert_command, args=(self.s, "test", "test alert", 99, 88),
+                         name="alert-command", daemon=True).start()
 
     def overlay_payload(self, q: dict) -> dict:
         s = self.s
@@ -1441,6 +1808,7 @@ class Widget:
         if now - self._last_check > 2:
             self._last_check = now
             if self.settings.changed_on_disk() and self.settings.reload():
+                log("settings.json changed on disk, reloaded")
                 self.after_settings_change(restart_overlay=True)
         self.redraw()
         self.root.after(500, self.tick)
@@ -1452,6 +1820,10 @@ class Widget:
             d = d[p]
         d[path[-1]] = value
         sanitize(self.s)
+        apply_logging(self.s)
+        dlog(f"setting changed: {'.'.join(path)} = {value!r}")
+        if path == ("logging", "debug"):
+            log(f"debug logging {'on' if value else 'off'}")
         self.settings.save()
         self.after_settings_change(restart_overlay=path[0] == "overlay" and path[-1] in ("enabled", "port"))
 
@@ -1477,6 +1849,30 @@ class Widget:
     def copy_overlay_url(self):
         self.root.clipboard_clear()
         self.root.clipboard_append(f"http://localhost:{self.s['overlay']['port']}/overlay")
+
+    def _open(self, target: Path, what: str):
+        try:
+            os.startfile(str(target))
+        except Exception:
+            log_exc(f"could not open {what}")
+
+    def open_log(self):
+        if not LOG_FILE.exists():
+            log("log opened by the user")
+        self._open(LOG_FILE, "the log")
+
+    def open_log_folder(self):
+        self._open(HERE, "the log folder")
+
+    def open_history_folder(self):
+        HISTORY_DIR.mkdir(exist_ok=True)
+        self._open(HISTORY_DIR, "the history folder")
+
+    def open_peaks(self):
+        if self.peaks_win and self.peaks_win.winfo_exists():
+            self.peaks_win.lift()
+            return
+        self.peaks_win = PeaksWindow(self)
 
     def open_settings_file(self):
         try:
@@ -1555,6 +1951,10 @@ class Widget:
         m.add_command(label="Test alert hook", command=self.test_alert)
         m.add_command(label="Open settings.json", command=self.open_settings_file)
         m.add_separator()
+        m.add_command(label="Peak temps...", command=self.open_peaks)
+        m.add_command(label="Open log", command=self.open_log)
+        m.add_command(label="Open log folder", command=self.open_log_folder)
+        m.add_separator()
         m.add_command(label="Quit", command=self.root.destroy)
         try:
             m.tk_popup(e.x_root, e.y_root)
@@ -1583,6 +1983,10 @@ def main() -> None:
     ap.add_argument("--settings", help="path to a settings file (default: settings.json next to this script)")
     ap.add_argument("--open-settings", nargs="?", const="general", choices=["general", "appearance"],
                     help="open the Settings window at startup (optionally on the given tab)")
+    ap.add_argument("--test-crash", choices=["main", "thread", "tk"],
+                    help="raise a fake exception to check that tracebacks reach temp_widget.log")
+    ap.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
+    install_exception_hooks()
     args = ap.parse_args()
     path = Path(args.settings or os.environ.get("TEMP_WIDGET_SETTINGS") or HERE / "settings.json").resolve()
 
@@ -1592,17 +1996,31 @@ def main() -> None:
         pass
     handle = single_instance(path)
     if handle is None:
+        log(f"another widget with the same settings is already running, exiting (v{VERSION})")
         return
     settings = Settings(path)
     settings.load()
     widget = Widget(settings)
+    if args.test_crash == "main":
+        raise RuntimeError("fake crash in the main thread (--test-crash main)")
+    if args.test_crash == "thread":
+        def boom():
+            raise RuntimeError("fake crash in a worker thread (--test-crash thread)")
+        threading.Thread(target=boom, name="crash-test", daemon=True).start()
+    if args.test_crash == "tk":
+        def tk_boom():
+            raise RuntimeError("fake crash in a Tk callback (--test-crash tk)")
+        widget.root.after(800, tk_boom)
     if args.open_settings:
         def open_win():
             widget.open_settings()
             if args.open_settings == "appearance":
                 widget.settings_win.nb.select(1)
         widget.root.after(300, open_win)
-    widget.run()
+    try:
+        widget.run()
+    finally:
+        log("widget closed (main loop ended)")
     del handle
 
 

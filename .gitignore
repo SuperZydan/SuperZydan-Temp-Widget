@@ -7,6 +7,9 @@ settings.json.tmp
 __pycache__/
 *.pyc
 
+# temperature history
+history/
+
 # logs
 *.log
 *.log.old

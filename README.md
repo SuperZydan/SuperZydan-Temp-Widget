@@ -39,7 +39,7 @@ Without LibreHardwareMonitor the widget still shows GPU temperature, fan, load, 
 4. Double-click `Start-Temp-Widget.bat`. It finds Python through the `py` launcher or `pythonw` on your PATH and runs the widget without a console window.
 5. On the first run the widget creates `settings.json` next to the script (a copy of `settings.example.json`).
 
-Left-drag the widget to move it. Right-click it for the menu: Settings, layout, size, lock position, start with Windows, copy the overlay URL, test the alert hook, quit.
+Left-drag the widget to move it. Right-click it for the menu: Settings, layout, size, lock position, start with Windows, copy the overlay URL, test the alert hook, peak temps, open the log, quit.
 
 To start it with Windows, use **Start with Windows** in the menu or the Settings window. That puts a small `.vbs` file in your Startup folder. Untick it to remove the file.
 
@@ -58,6 +58,7 @@ The **General** tab has:
 - refresh rate
 - warn and hot limits for each sensor (yellow at warn, red at hot)
 - alert hook on/off and a test button
+- logging and history: record temperature history, debug logging, peak temps, and buttons that open the log, the log folder and the history folder
 - stream overlay on/off, port, and a button that copies the URL
 - start with Windows, lock position
 
@@ -121,8 +122,31 @@ If port 8086 is taken by something else, change `overlay.port` in the Settings w
 | `show` | true/false for each line: `gpu_temp`, `gpu_details`, `gpu_hotspot`, `gpu_memory_temp`, `vram`, `cpu_temp`, `cpu_load`, `ram` |
 | `thresholds` | `warn` and `hot` for `gpu`, `gpu_hotspot`, `gpu_memory`, `cpu` (in °C) and `vram`, `ram` (in % used) |
 | `lhm_url` | LibreHardwareMonitor's data address, default `http://localhost:8085/data.json` |
+| `history` | `enabled`, record the history CSV (default false) |
+| `logging` | `debug`, extra detail in the log (default false) |
 | `overlay` | `enabled`, `port`, `layout`, `size`, `scale`, `show`, and `own_appearance` with its own `colors`, `fonts` and `outline_width` |
 | `alerts` | see below |
+
+## Logs, history and peak temps
+
+**Log.** `temp_widget.log` sits next to the script. On every start it records the widget version, Python version, GPU name, and whether `nvidia-smi` and LibreHardwareMonitor were found. After that it only writes when something changes: alerts, a sensor source going away or coming back (one line each time, no repeats), and errors. Any crash or unexpected error is written with its full traceback, including errors inside the Settings window and background threads. When the file passes 500 KB it is renamed to `temp_widget.log.old`.
+
+**Debug logging.** Tick **Debug logging** in Settings (`"logging": {"debug": true}`) to also log every poll with its readings, settings changes, overlay requests and alert progress. Leave it off normally.
+
+**Temperature history.** Tick **Record temperature history** in Settings (`"history": {"enabled": true}`) and the widget adds one row a minute to `history/YYYY-MM.csv`, one file per month:
+
+```
+time,gpu_c,gpu_hotspot_c,gpu_memory_c,cpu_c,vram_used_gb,ram_used_gb
+2026-11-20 14:31:09,62.0,71.4,68.0,55.0,7.4,24.8
+```
+
+Empty cells mean that sensor wasn't available. It is off by default and the folder is not committed to git.
+
+**Peak temps.** Right-click > **Peak temps...** (or the button in Settings) shows the highest GPU core, hotspot, memory and CPU temperatures for this session and for today, and the time each one happened. Peaks are tracked whether or not history is recording. If history was recording earlier today, those rows are counted too after a restart.
+
+**Open log / Open log folder** are in the right-click menu and in Settings.
+
+![Peak temps](screenshots/peak-temps.png)
 
 ## Alert hook
 
@@ -203,7 +227,8 @@ Use **Test alert hook** in the right-click menu (or **Test alert** in Settings) 
 | `settings.example.json` | all options with defaults |
 | `temp_widget.ico` | icon for shortcuts |
 | `settings.json` | your settings, created on first run |
-| `temp_widget.log` | alerts and errors, created when needed |
+| `temp_widget.log` | startup report, alerts, source changes and errors, created when needed |
+| `history/` | temperature history CSVs, only if you turn recording on |
 
 To make a desktop shortcut, create one to `Start-Temp-Widget.bat` and pick `temp_widget.ico` as its icon.
 
@@ -211,7 +236,12 @@ To make a desktop shortcut, create one to `Start-Temp-Widget.bat` and pick `temp
 
 - Only NVIDIA GPUs are read through nvidia-smi. Hotspot and memory temps come from LibreHardwareMonitor, so they show up for any card it supports.
 - Temperatures are in °C.
-- Command line options: `--settings <file>` uses a different settings file (and allows a second widget), `--open-settings [general|appearance]` opens the Settings window on start.
+- Command line options: `--settings <file>` uses a different settings file (and allows a second widget), `--open-settings [general|appearance]` opens the Settings window on start, `--version` prints the version, `--test-crash main|thread|tk` raises a fake error to check that tracebacks reach the log.
+
+## Changes
+
+- **v1.1**: logging (startup report, source changes, tracebacks for every crash, debug option), optional temperature history, peak temps window, open log shortcuts, version shown in Settings. Fixed: a second widget could silently share the overlay port instead of reporting that it was in use.
+- **v1.0**: first release.
 
 ## License
 

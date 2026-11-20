@@ -55,6 +55,12 @@
     }
   },
   "lhm_url": "http://localhost:8085/data.json",
+  "history": {
+    "enabled": false
+  },
+  "logging": {
+    "debug": false
+  },
   "overlay": {
     "enabled": true,
     "port": 8086,
