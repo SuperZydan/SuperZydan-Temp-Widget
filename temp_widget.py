@@ -1632,7 +1632,8 @@ class SettingsWindow(tk.Toplevel):
         lines = build_lines(sample, show, "vertical", s, ap["colors"])
         self.preview.delete("all")
         size = s["overlay"]["size"] if ov else s["size"]
-        w, h = draw_lines(self.preview, lines, self.app.fontbook, size, ap, self.app.dpi)   # same size as the widget
+        # at this window's own scale, so it is in proportion even when the widget is on another monitor
+        w, h = draw_lines(self.preview, lines, self.app.fontbook, size, ap, self.winfo_fpixels("1i"))
         self.preview.configure(width=max(ui_px(self, 330), w), height=max(ui_px(self, 170), h))
 
     def _get(self, *path):
@@ -2159,8 +2160,6 @@ class Widget:
             # Straddling two monitors: the new size moved most of the window back to the other one.
             # Keep this size until the window is moved, instead of flipping back and forth.
             self._dpi_hold = (pos, other)
-        if self.settings_win:
-            self.settings_win.sync()
 
     def tick(self):
         if self.stopping:
