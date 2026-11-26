@@ -42,7 +42,7 @@ LOG_FILE = HERE / "temp_widget.log"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 KEY = "#010101"  # this exact color becomes see-through
 APP_NAME = "Temp Widget"
-VERSION = "1.1.1"
+VERSION = "1.2"
 HISTORY_DIR = HERE / "history"
 DEBUG = False  # set from settings: logging.debug
 
@@ -133,12 +133,15 @@ ALERT_SENSORS = [
 # ---------------------------------------------------------------- logging
 
 _log_lock = threading.Lock()
+LOG_OFF = False     # set when Uninstall deletes the logs, so nothing creates them again
 
 
 def log(msg: str, level: str = "INFO") -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {level:<5} {msg}\n"
     try:
         with _log_lock:
+            if LOG_OFF:
+                return
             if LOG_FILE.exists() and LOG_FILE.stat().st_size > 500_000:
                 LOG_FILE.replace(LOG_FILE.with_suffix(".log.old"))
             with LOG_FILE.open("a", encoding="utf-8") as f:
@@ -212,6 +215,7 @@ def startup_report(settings_path: Path, cfg: dict) -> None:
     log(f"=== Temp Widget v{VERSION} starting ===")
     log(f"Python {platform.python_version()} ({sys.executable}), {platform.platform()}")
     log(f"settings file: {settings_path}")
+    log(f"DPI awareness: {({2: 'per monitor', 1: 'system wide'}).get(DPI_AWARENESS, 'none')}")
     exe = shutil.which("nvidia-smi")
     name = gpu_name() if exe else None
     log(f"nvidia-smi: {'found at ' + exe if exe else 'NOT found on PATH (GPU lines will be empty)'}")
@@ -331,6 +335,7 @@ class Settings:
         self.path = path
         self.data = sanitize(copy.deepcopy(DEFAULTS))
         self.mtime = 0.0
+        self.frozen = False     # set when Uninstall deletes the file, so it is not written again
 
     def _stamp(self):
         try:
@@ -368,6 +373,8 @@ class Settings:
         return True
 
     def save(self) -> None:
+        if self.frozen:
+            return
         try:
             tmp = self.path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
@@ -668,17 +675,20 @@ class FontBook:
                 return f, not re.search(r"black|heavy|extrabold", f, re.I)
         return "Arial", True
 
-    def font(self, wanted: str, size: int) -> tkfont.Font:
+    def font(self, wanted: str, size: int, dpi: float) -> tkfont.Font:
+        """A font of `size` points as it should look on a monitor at `dpi`. The size is handed to Tk in
+        pixels (negative), so it does not depend on Tk's one global scaling factor."""
         fam, bold = self.resolve(wanted)
-        key = (fam, bold, size)
+        px = max(1, int(size * dpi / 72 + 0.5))
+        key = (fam, bold, px)
         if key not in self._cache:
-            self._cache[key] = tkfont.Font(root=self.root, family=fam, size=size,
+            self._cache[key] = tkfont.Font(root=self.root, family=fam, size=-px,
                                            weight="bold" if bold else "normal")
         return self._cache[key]
 
 
 def outline_px(width: int, size_pt: int) -> int:
-    """Outline thickness in pixels for a font size (bigger text gets a bit more)."""
+    """Outline thickness in pixels at 100% scaling for a font size (bigger text gets a bit more)."""
     if width <= 0:
         return 0
     return max(width, round(width * size_pt / 26))
@@ -699,32 +709,93 @@ def ring_offsets(w: int) -> list[tuple[int, int]]:
     return _RING[w]
 
 
-def draw_lines(canvas: tk.Canvas, lines: list[dict], fb: FontBook, size_name: str, ap: dict) -> tuple[int, int]:
-    """Draws lines of colored runs with an outline. Returns the (width, height) used."""
-    big, small = SIZES[size_name]
-    pad = 8
+# Spacing, as fractions of real font metrics, so it follows the font and the monitor's scaling.
+BIG_PITCH = 0.82    # big lines hold digits and capitals only, so they can sit closer than a full line
+INK = {"big": 0.98, "small": 1.1}   # height of the glyphs in font sizes; a line is never lower than this + outline
+PAD = 0.36          # space around everything, in small-text line heights
+GAP = 0.32          # extra space after a GPU / CPU / RAM block, in small-text line heights
+TAIL = 0.27         # extra room on the right, in small-text line heights
+
+
+def draw_lines(canvas: tk.Canvas, lines: list[dict], fb: FontBook, size_name: str, ap: dict,
+               dpi: float) -> tuple[int, int]:
+    """Draws lines of colored runs with an outline, scaled for a monitor at `dpi`.
+    Returns the (width, height) used. Each line's canvas items are tagged line0, line1, ..."""
+    sizes = dict(zip(("big", "small"), SIZES[size_name]))
+    outlines = {}
+    for kind, pt in sizes.items():
+        w = outline_px(ap["outline_width"], pt)
+        outlines[kind] = int(w * dpi / 96 + 0.5) if w else 0
+    thickest = max(outlines.values())
+    line_height = fb.font(ap["fonts"]["small"], sizes["small"], dpi).metrics("linespace")
+    pad = max(round(line_height * PAD), thickest + 2)
     y, width = pad, 0
-    for ln in lines:
+    for i, ln in enumerate(lines):
         runs = ln["runs"]
-        has_big = any(r["k"] == "big" for r in runs)
-        pitch = int(big * 1.45) if has_big else int(small * 1.85)
+        kinds = ["big" if r["k"] == "big" else "small" for r in runs]
+        fonts = [fb.font(ap["fonts"][k], sizes[k], dpi) for k in kinds]
+        metrics = [f.metrics() for f in fonts]
+        ascent = max(m["ascent"] for m in metrics)
+        descent = max(m["descent"] for m in metrics)
+        room = max(round(-f.cget("size") * INK[k]) + 2 * outlines[k] for f, k in zip(fonts, kinds))
+        pitch = max(round((ascent + descent) * (BIG_PITCH if "big" in kinds else 1)), room)
+        if i == 0:      # the full height of the first line, outline included, has to be on the canvas
+            y = max(y, ascent + descent - pitch + thickest)
         bottom = y + pitch
-        fonts = [(fb.font(ap["fonts"]["big" if r["k"] == "big" else "small"], big if r["k"] == "big" else small),
-                  big if r["k"] == "big" else small) for r in runs]
-        descent = max(f.metrics("descent") for f, _ in fonts)
         x = pad
-        for r, (f, size) in zip(runs, fonts):
-            ty = bottom - descent + f.metrics("descent")
-            w = outline_px(ap["outline_width"], size)
+        for r, kind, f, m in zip(runs, kinds, fonts, metrics):
+            ty = bottom - descent + m["descent"]          # all runs share one baseline
+            w = outlines[kind]
             for dx, dy in (ring_offsets(w) if w else ()):
-                canvas.create_text(x + dx, ty + dy, text=r["t"], font=f, fill=ap["colors"]["outline"], anchor="sw")
-            canvas.create_text(x, ty, text=r["t"], font=f, fill=r["c"], anchor="sw")
+                canvas.create_text(x + dx, ty + dy, text=r["t"], font=f, fill=ap["colors"]["outline"], anchor="sw",
+                                   tags=(f"line{i}",))
+            canvas.create_text(x, ty, text=r["t"], font=f, fill=r["c"], anchor="sw", tags=(f"line{i}",))
             x += f.measure(r["t"])
         width = max(width, x)
-        y = bottom + (int(small * 0.6) if ln["end"] else 0)
+        y = bottom + (round(line_height * GAP) if ln["end"] else 0)
     if not lines:
-        width, y = 40, pad + 20
-    return width + pad + 6, y + pad
+        width, y = line_height * 2, pad + line_height
+    return width + pad + round(line_height * TAIL), y + pad
+
+
+# ---------------------------------------------------------------- display scaling (DPI)
+
+DPI_AWARENESS = 0   # 2 = per monitor, 1 = system wide, 0 = Windows scales the window for us
+
+
+def set_dpi_awareness() -> int:
+    """Per-monitor DPI aware (2), else system DPI aware (1). Must run before the first window exists."""
+    global DPI_AWARENESS
+    for level in (2, 1):
+        try:
+            if ctypes.windll.shcore.SetProcessDpiAwareness(level) == 0:    # returns an error code, no exception
+                DPI_AWARENESS = level
+                break
+        except (AttributeError, OSError):
+            break
+    return DPI_AWARENESS
+
+
+def window_dpi(widget: tk.Misc) -> int:
+    """DPI of the monitor the widget's window is on (96 = 100%, 120 = 125%, 144 = 150%)."""
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+            u32 = ctypes.WinDLL("user32")
+            u32.GetAncestor.argtypes, u32.GetAncestor.restype = [wintypes.HWND, wintypes.UINT], wintypes.HWND
+            u32.GetDpiForWindow.argtypes, u32.GetDpiForWindow.restype = [wintypes.HWND], wintypes.UINT
+            hwnd = u32.GetAncestor(widget.winfo_id(), 2)    # GA_ROOT
+            dpi = u32.GetDpiForWindow(hwnd)                 # Windows 10 1607 and newer
+            if dpi:
+                return int(dpi)
+        except (AttributeError, OSError):
+            pass
+    return round(widget.winfo_fpixels("1i"))
+
+
+def ui_px(widget: tk.Misc, pixels_at_100: float) -> int:
+    """A fixed pixel size in the Settings and Peak temps windows, scaled like their point-sized fonts."""
+    return int(pixels_at_100 * widget.winfo_fpixels("1i") / 96 + 0.5)
 
 
 # ---------------------------------------------------------------- alerts
@@ -1390,7 +1461,9 @@ class SettingsWindow(tk.Toplevel):
         bar = ttk.Frame(self)
         bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(8, 14))
         ttk.Button(bar, text="Open settings.json", command=a.open_settings_file).pack(side="left")
+        ttk.Button(bar, text="Uninstall...", command=a.open_uninstall).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="Close", command=self.close).pack(side="right")
+        ttk.Button(bar, text="Restart", command=a.restart).pack(side="right", padx=(0, 8))
 
     # ----- Appearance tab
     def _ap_path(self, *tail):
@@ -1442,14 +1515,14 @@ class SettingsWindow(tk.Toplevel):
         ttk.Label(fonts, text="Outline").grid(row=3, column=0, sticky="w", pady=(10, 4))
         self.outline_var = tk.DoubleVar()
         self.vars["outline"] = (self.outline_var, lambda: self._ap_get("outline_width"))
-        sc = ttk.Scale(fonts, from_=0, to=8, variable=self.outline_var, length=190,
+        sc = ttk.Scale(fonts, from_=0, to=8, variable=self.outline_var, length=ui_px(self, 190),
                        command=self._outline_moved)
         sc.grid(row=3, column=1, sticky="w", pady=(10, 4))
         self.outline_label = ttk.Label(fonts, text="", width=9)
         self.outline_label.grid(row=3, column=2, sticky="w", padx=6, pady=(10, 4))
         ttk.Label(fonts, text="Preview", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 2))
-        self.preview = tk.Canvas(fonts, width=330, height=170, bg="#26323d", highlightthickness=1,
-                                 highlightbackground=FIELD)
+        self.preview = tk.Canvas(fonts, width=ui_px(self, 330), height=ui_px(self, 170), bg="#26323d",
+                                 highlightthickness=1, highlightbackground=FIELD)
         self.preview.grid(row=5, column=0, columnspan=3, sticky="w")
         fonts.grid(row=1, column=1, sticky="nsew", padx=(8, 16), pady=8)
 
@@ -1559,8 +1632,8 @@ class SettingsWindow(tk.Toplevel):
         lines = build_lines(sample, show, "vertical", s, ap["colors"])
         self.preview.delete("all")
         size = s["overlay"]["size"] if ov else s["size"]
-        w, h = draw_lines(self.preview, lines, self.app.fontbook, size, ap)
-        self.preview.configure(width=max(330, w), height=max(170, h))
+        w, h = draw_lines(self.preview, lines, self.app.fontbook, size, ap, self.app.dpi)   # same size as the widget
+        self.preview.configure(width=max(ui_px(self, 330), w), height=max(ui_px(self, 170), h))
 
     def _get(self, *path):
         v = self.app.settings.data
@@ -1632,7 +1705,8 @@ class PeaksWindow(tk.Toplevel):
                 lab.grid(row=r, column=c, sticky="w", padx=(0, 18), pady=3)
                 cells.append(lab)
             self.cells[sid] = cells
-        self.note = ttk.Label(self, text="", style="Ver.TLabel", wraplength=470, justify="left")
+        card.update_idletasks()                             # wrap the note to the table's real width
+        self.note = ttk.Label(self, text="", style="Ver.TLabel", wraplength=card.winfo_reqwidth(), justify="left")
         self.note.grid(row=2, column=0, sticky="w", padx=18, pady=(2, 6))
         bar = ttk.Frame(self)
         bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(4, 14))
@@ -1678,6 +1752,236 @@ class PeaksWindow(tk.Toplevel):
         self.destroy()
 
 
+# ---------------------------------------------------------------- uninstall
+
+TASK_NAME = "SuperZydan Temp Widget"
+
+
+def startup_vbs_path() -> Path:
+    return Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs\Startup\Temp Widget.vbs"
+
+
+def desktop_dirs() -> list[Path]:
+    """Your desktop and the all-users desktop, wherever they really are (OneDrive moves yours)."""
+    out = []
+    for csidl in (0x10, 0x19):      # CSIDL_DESKTOPDIRECTORY, CSIDL_COMMON_DESKTOPDIRECTORY
+        buf = ctypes.create_unicode_buffer(1024)
+        try:
+            if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0 and buf.value:
+                out.append(Path(buf.value))
+        except (AttributeError, OSError):
+            pass
+    return out
+
+
+def run_powershell(script: str, values: dict[str, str]) -> str:
+    """Runs a fixed script with Windows PowerShell. Names and paths go in as environment variables, never
+    as part of the script text. The script must not contain double quotes."""
+    exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / r"System32\WindowsPowerShell\v1.0\powershell.exe"
+    head = ("$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; "
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; ")
+    proc = subprocess.run([str(exe), "-NoProfile", "-NonInteractive", "-Command", head + script],
+                          capture_output=True, timeout=60, creationflags=NO_WINDOW, stdin=subprocess.DEVNULL,
+                          env=dict(os.environ, **values))
+    if proc.returncode:
+        err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(err[0][:300] if err else f"PowerShell exit code {proc.returncode}")
+    return proc.stdout.decode("utf-8-sig", "replace").strip()
+
+
+PS_FIND_TASK = (
+    "$found = @(Get-ScheduledTask | Where-Object { $_.TaskName -eq $env:TW_TASK } | ForEach-Object { "
+    "[pscustomobject]@{ path = $_.TaskPath; actions = @($_.Actions | ForEach-Object { [pscustomobject]@{ "
+    "execute = [string]$_.Execute; arguments = [string]$_.Arguments; workdir = [string]$_.WorkingDirectory } }) } }); "
+    "ConvertTo-Json -InputObject $found -Depth 5 -Compress")
+PS_REMOVE_TASK = "Unregister-ScheduledTask -TaskName $env:TW_TASK -TaskPath $env:TW_PATH -Confirm:$false"
+PS_SHORTCUTS = (
+    "$shell = New-Object -ComObject WScript.Shell; "
+    "$found = @(foreach ($dir in ($env:TW_DIRS -split '\\|')) { "
+    "if ($dir -and (Test-Path -LiteralPath $dir)) { "
+    "Get-ChildItem -LiteralPath $dir -Filter *.lnk -File -Force | ForEach-Object { "
+    "try { $s = $shell.CreateShortcut($_.FullName); [pscustomobject]@{ file = $_.FullName; "
+    "execute = [string]$s.TargetPath; arguments = [string]$s.Arguments; workdir = [string]$s.WorkingDirectory } "
+    "} catch {} } } }); "
+    "ConvertTo-Json -InputObject $found -Depth 3 -Compress")
+
+
+def points_to_widget(command: str, workdir: str, folder: Path, script: Path) -> bool:
+    """True if a command line starts this copy of the widget: its script or its launcher, by full path,
+    or by bare file name when the working directory is the widget's folder."""
+    def norm(s) -> str:
+        return os.path.expandvars(str(s)).replace("/", "\\").lower()
+
+    text = norm(command)
+    in_folder = norm(workdir).strip().strip('"').rstrip("\\") == norm(folder).rstrip("\\")
+    for target in (script, folder / "Start-Temp-Widget.bat"):
+        if re.search(r'(?<![^\s"=])' + re.escape(norm(target)) + r'(?![^\s"])', text):
+            return True
+        if in_folder and re.search(r'(?<![^\s"])(?:\.\\)?' + re.escape(norm(target.name)) + r'(?![^\s"])', text):
+            return True
+    return False
+
+
+def remove_autostart(startup_vbs: Path, task_name: str, desktops: list[Path], folder: Path, script: Path) -> dict:
+    """Removes the Startup folder .vbs, the scheduled task and desktop shortcuts, but only those that
+    start this copy of the widget. Returns {"removed": [...], "kept": [...], "failed": [...]}."""
+    result: dict[str, list[str]] = {"removed": [], "kept": [], "failed": []}
+
+    # Startup folder entry
+    label = f"Startup folder entry ({startup_vbs.name})"
+    try:
+        if startup_vbs.is_file():
+            raw = startup_vbs.read_bytes()
+            text = raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8", "replace")
+            if points_to_widget(text, "", folder, script):
+                startup_vbs.unlink()
+                result["removed"].append(label)
+            else:
+                result["kept"].append(f"{label}: it does not start this copy of the widget")
+    except OSError as e:
+        result["failed"].append(f"{label}: {e}")
+
+    # scheduled task
+    label = f"scheduled task \"{task_name}\""
+    try:
+        for task in json.loads(run_powershell(PS_FIND_TASK, {"TW_TASK": task_name}) or "[]"):
+            if not any(points_to_widget(f'"{a["execute"]}" {a["arguments"]}', a["workdir"], folder, script)
+                       for a in task["actions"]):
+                result["kept"].append(f"{label}: it does not start this copy of the widget")
+                continue
+            try:
+                run_powershell(PS_REMOVE_TASK, {"TW_TASK": task_name, "TW_PATH": task["path"]})
+                result["removed"].append(label)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+                result["failed"].append(f"{label} (delete it in Task Scheduler, it may need admin rights): {e}")
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        result["failed"].append(f"{label}: could not check for it ({e})")
+
+    # desktop shortcuts
+    try:
+        raw_list = run_powershell(PS_SHORTCUTS, {"TW_DIRS": "|".join(str(d) for d in desktops)})
+        for link in json.loads(raw_list or "[]"):
+            if not points_to_widget(f'"{link["execute"]}" {link["arguments"]}', link["workdir"], folder, script):
+                continue
+            path = Path(link["file"])
+            try:
+                path.unlink()
+                result["removed"].append(f"desktop shortcut ({path.name})")
+            except OSError as e:
+                result["failed"].append(f"desktop shortcut {path}: {e}")
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        result["failed"].append(f"desktop shortcuts: could not check them ({e})")
+    return result
+
+
+def delete_user_data(settings: "Settings", log_file: Path, history_dir: Path) -> tuple[list[str], list[str]]:
+    """Deletes this widget's settings, logs and history CSVs, by name. Logging and saving are switched off
+    first so nothing writes them again while the widget closes. Returns (removed, problems)."""
+    global LOG_OFF
+    with _log_lock:
+        LOG_OFF = True
+    settings.frozen = True
+    removed: list[str] = []
+    problems: list[str] = []
+
+    def delete(path: Path) -> bool:
+        try:
+            if not path.is_file():
+                return False
+            path.unlink()
+            return True
+        except OSError as e:
+            problems.append(f"{path}: {e}")
+            return False
+
+    for label, paths in (("settings", (settings.path, settings.path.with_suffix(".json.tmp"))),
+                         ("logs", (log_file, log_file.with_suffix(".log.old")))):
+        if sum([delete(p) for p in paths]):
+            removed.append(label)
+    if history_dir.is_dir():
+        # only the monthly files the widget writes; anything else in there is not ours to delete
+        count = sum([delete(p) for p in history_dir.glob("*.csv") if re.fullmatch(r"\d{4}-\d{2}\.csv", p.name)])
+        if count:
+            removed.append(f"temperature history ({count} file{'s' if count > 1 else ''})")
+        try:
+            history_dir.rmdir()     # fails, on purpose, if something else is in it
+        except OSError:
+            if any(history_dir.iterdir()):
+                problems.append(f"{history_dir}: left in place, it holds files the widget did not make")
+    return removed, problems
+
+
+def uninstall_message(result: dict, deleted_data: bool, folder: Path) -> str:
+    parts = []
+    if result["failed"]:
+        parts.append("Temp Widget is closing, but some things could not be removed.")
+    else:
+        parts.append("Temp Widget is uninstalled.")
+    for key, title in (("removed", "Removed:"), ("kept", "Left alone:"), ("failed", "Could NOT remove:")):
+        if result[key]:
+            parts.append(title + "\n" + "\n".join(f"  - {item}" for item in result[key]))
+    if not result["removed"]:
+        parts.append("There was nothing set up to start it or show it.")
+    if not deleted_data:
+        parts.append("Your settings, logs and history were kept.")
+    if result["failed"]:
+        parts.append(f"Remove those by hand, then you can delete the program folder:\n{folder}")
+    else:
+        parts.append(f"You can now delete the program folder:\n{folder}")
+    parts.append("LibreHardwareMonitor is a separate program. If you no longer need it, "
+                 "you can uninstall it on its own.")
+    return "\n\n".join(parts)
+
+
+class UninstallDialog(tk.Toplevel):
+    """Confirms the uninstall and asks whether to delete the data too."""
+
+    def __init__(self, app: "Widget", parent: tk.Misc):
+        super().__init__(parent)
+        self.app = app
+        self.title(f"Uninstall {APP_NAME}")
+        self.configure(bg=BG)
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        setup_style(self)
+        ttk.Label(self, text=f"Uninstall {APP_NAME}?", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w", padx=16, pady=(12, 4))
+        card = ttk.Frame(self, style="Card.TFrame", padding=(14, 10))
+        card.grid(row=1, column=0, sticky="ew", padx=16, pady=6)
+        text = ("This removes what makes the widget start or show up:\n"
+                "  - the entry in your Startup folder\n"
+                f"  - the \"{TASK_NAME}\" scheduled task, if there is one\n"
+                "  - the desktop shortcut, if it points to this widget\n\n"
+                "Then the widget closes. The program folder is not deleted.")
+        ttk.Label(card, text=text, justify="left").grid(row=0, column=0, sticky="w")
+        self.delete_data = tk.BooleanVar(value=False)
+        ttk.Checkbutton(card, text="Also delete my settings, logs and history.",
+                        variable=self.delete_data).grid(row=1, column=0, sticky="w", pady=(12, 2))
+        bar = ttk.Frame(self)
+        bar.grid(row=2, column=0, sticky="ew", padx=16, pady=(4, 14))
+        self.cancel_button = ttk.Button(bar, text="Cancel", command=self.destroy)
+        self.cancel_button.pack(side="right")
+        self.ok_button = ttk.Button(bar, text="Uninstall", command=self.confirm)
+        self.ok_button.pack(side="right", padx=(0, 8))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        if parent is app.root:
+            x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
+            y = (self.winfo_screenheight() - self.winfo_reqheight()) // 2
+        else:                                   # over the Settings window, wherever that is
+            x, y = parent.winfo_rootx() + 40, parent.winfo_rooty() + 80
+        self.geometry(f"+{x}+{y}")
+        self.wait_visibility()
+        self.grab_set()
+        self.cancel_button.focus_set()
+
+    def confirm(self):
+        delete = bool(self.delete_data.get())
+        self.grab_release()
+        self.destroy()
+        self.app.uninstall(delete)
+
+
 # ---------------------------------------------------------------- the widget
 
 class Widget:
@@ -1695,6 +1999,9 @@ class Widget:
         self._last_draw = None
         self._last_check = 0.0
         self._dx = self._dy = 0
+        self._dragging = False
+        self._dpi_hold: tuple | None = None
+        self.stopping = False       # set while uninstalling
 
         self.root = tk.Tk()
         self.root.report_callback_exception = lambda t, v, tb: log_exc("Unhandled exception in a Tk callback", (t, v, tb))
@@ -1717,11 +2024,14 @@ class Widget:
         self.canvas.bind("<B1-Motion>", self.drag)
         self.canvas.bind("<ButtonRelease-1>", self.end_drag)
         self.canvas.bind("<Button-3>", self.menu)
+        self.root.update_idletasks()
+        self.dpi = window_dpi(self.root)
 
         self.overlay = OverlayServer(self)
         self.apply_overlay()
 
-        threading.Thread(target=self.poll, name="poll", daemon=True).start()
+        self.poll_thread = threading.Thread(target=self.poll, name="poll", daemon=True)
+        self.poll_thread.start()
         self.redraw()
         self.root.after(500, self.tick)
 
@@ -1738,10 +2048,12 @@ class Widget:
                 log(f"peaks: seeded today's peaks from {rows} history rows")
         except Exception:
             log_exc("startup report failed")
-        while True:
+        while not self.stopping:
             try:
                 t0 = time.time()
                 st = collect(self.s)
+                if self.stopping:
+                    break
                 self.state = st
                 self.track_sources(st)
                 self.peaks.update(readings_from(st), t0)
@@ -1821,15 +2133,39 @@ class Widget:
         s = self.s
         ap = appearance(s)
         lines = build_lines(self.state, s["show"], s["layout"], s, ap["colors"])
-        sig = (json.dumps(lines), s["size"], json.dumps(ap, sort_keys=True))
+        sig = (json.dumps(lines), s["size"], json.dumps(ap, sort_keys=True), self.dpi)
         if sig == self._last_draw and not force:
             return
         self._last_draw = sig
         self.canvas.delete("all")
-        w, h = draw_lines(self.canvas, lines, self.fontbook, s["size"], ap)
+        w, h = draw_lines(self.canvas, lines, self.fontbook, s["size"], ap, self.dpi)
         self.canvas.config(width=w, height=h)
 
+    def check_dpi(self):
+        """Redraws when the window is on a monitor with a different scale (moved there, or the Windows
+        setting changed). Tk 8.6 does not report this itself, so tick() and the end of a drag ask."""
+        if self._dragging:
+            return
+        pos = (self.root.winfo_x(), self.root.winfo_y())
+        dpi = window_dpi(self.root)
+        if dpi == self.dpi or self._dpi_hold == (pos, dpi):
+            return
+        log(f"display scaling is now {dpi / 96:.0%} (was {self.dpi / 96:.0%}), redrawing")
+        self.dpi, self._dpi_hold = dpi, None
+        self.redraw(force=True)
+        self.root.update_idletasks()
+        other = window_dpi(self.root)
+        if other != dpi:
+            # Straddling two monitors: the new size moved most of the window back to the other one.
+            # Keep this size until the window is moved, instead of flipping back and forth.
+            self._dpi_hold = (pos, other)
+        if self.settings_win:
+            self.settings_win.sync()
+
     def tick(self):
+        if self.stopping:
+            return
+        self.check_dpi()
         now = time.time()
         if now - self._last_check > 2:
             self._last_check = now
@@ -1909,6 +2245,7 @@ class Widget:
     # ---------- interaction
     def start_drag(self, e):
         self._dx, self._dy = e.x, e.y
+        self._dragging = True
 
     def drag(self, e):
         if self.s["locked"]:
@@ -1918,14 +2255,65 @@ class Widget:
         self.root.geometry(f"+{x}+{y}")
 
     def end_drag(self, _e):
+        self._dragging = False
         if self.s["locked"]:
             return
         self.s["x"], self.s["y"] = self.root.winfo_x(), self.root.winfo_y()
         self.settings.save()
+        self.check_dpi()
+
+    # ---------- restart and uninstall
+    def restart(self):
+        """Starts a fresh copy with the same arguments, then closes this one."""
+        cmd = restart_command(sys.argv[1:])
+        try:
+            subprocess.Popen(cmd, cwd=os.getcwd(), close_fds=True,
+                             creationflags=0x00000008 | 0x00000200 if os.name == "nt" else 0,  # detached, own group
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            log_exc("restart: could not start the new copy, this one keeps running")
+            from tkinter import messagebox
+            messagebox.showerror(APP_NAME, "Could not start a new copy, so this one keeps running.\n"
+                                           "The log has the details.", parent=self.settings_win or self.root)
+            return
+        log("restart: started a new copy, closing this one")
+        self.overlay.stop()
+        self.root.destroy()
+
+    def open_uninstall(self):
+        UninstallDialog(self, self.settings_win or self.root)
+
+    def uninstall(self, delete_data: bool):
+        """Removes what starts or shows the widget (and optionally its data), says so, and closes."""
+        from tkinter import messagebox
+        log(f"uninstall started (delete settings, logs and history: {'yes' if delete_data else 'no'})")
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        result = remove_autostart(startup_vbs_path(), TASK_NAME, desktop_dirs(), HERE, Path(__file__).resolve())
+        for kind, text in (("removed", "removed"), ("kept", "left alone"), ("failed", "COULD NOT remove")):
+            for item in result[kind]:
+                log(f"uninstall: {text}: {item}", "WARN" if kind == "failed" else "INFO")
+        self.stopping = True            # tick() and the poll thread stop writing
+        self.wake.set()
+        self.overlay.stop()
+        if delete_data:
+            self.poll_thread.join(timeout=15)
+            removed, problems = delete_user_data(self.settings, LOG_FILE, HISTORY_DIR)
+            result["removed"] += removed
+            result["failed"] += problems
+        for win in (self.peaks_win, self.settings_win):
+            if win:
+                win.close()
+        self.root.withdraw()
+        try:
+            os.chdir(os.environ.get("TEMP") or str(Path.home()))     # don't hold the program folder open
+        except OSError:
+            pass
+        messagebox.showinfo(f"{APP_NAME} uninstalled", uninstall_message(result, delete_data, HERE), parent=self.root)
+        self.root.destroy()
 
     def startup_file(self) -> Path:
-        return (Path(os.environ.get("APPDATA", "")) /
-                r"Microsoft\Windows\Start Menu\Programs\Startup\Temp Widget.vbs")
+        return startup_vbs_path()
 
     def startup_enabled(self) -> bool:
         return self.startup_file().exists()
@@ -1981,6 +2369,7 @@ class Widget:
         m.add_command(label="Open log", command=self.open_log)
         m.add_command(label="Open log folder", command=self.open_log_folder)
         m.add_separator()
+        m.add_command(label="Restart", command=self.restart)
         m.add_command(label="Quit", command=self.root.destroy)
         try:
             m.tk_popup(e.x_root, e.y_root)
@@ -1993,15 +2382,32 @@ class Widget:
 
 # ---------------------------------------------------------------- entry point
 
-def single_instance(settings_path: Path):
-    """Returns a handle to keep alive, or None if another widget with the same settings is running."""
+def single_instance(settings_path: Path, wait: float = 0.0):
+    """Returns a handle to keep alive, or None if another widget with the same settings is running.
+    `wait` is how many seconds to give that other widget to exit (used by Restart)."""
     if os.name != "nt":
         return object()
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
     name = "Local\\TempWidget-" + hashlib.md5(str(settings_path).lower().encode()).hexdigest()[:12]
-    handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        return None
-    return handle
+    deadline = time.monotonic() + wait
+    while True:
+        handle = k32.CreateMutexW(None, False, name)
+        if ctypes.get_last_error() != 183:      # ERROR_ALREADY_EXISTS
+            return handle or object()
+        k32.CloseHandle(handle)     # ours would keep the mutex alive after the other widget has gone
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def restart_command(argv: list[str]) -> list[str]:
+    """The command that starts a fresh copy of this widget with the same arguments."""
+    args = [a for a in argv if a != "--restarted"]
+    return [sys.executable, str(Path(__file__).resolve()), *args, "--restarted"]
 
 
 def main() -> None:
@@ -2011,6 +2417,8 @@ def main() -> None:
                                   "the --settings file when one is given)")
     ap.add_argument("--open-settings", nargs="?", const="general", choices=["general", "appearance"],
                     help="open the Settings window at startup (optionally on the given tab)")
+    ap.add_argument("--restarted", action="store_true",
+                    help="used by Restart: wait up to 10 s for the old widget to exit")
     ap.add_argument("--test-crash", choices=["main", "thread", "tk"],
                     help="raise a fake exception to check that tracebacks reach temp_widget.log")
     ap.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
@@ -2018,12 +2426,9 @@ def main() -> None:
     args = ap.parse_args()
     path = Path(args.settings or os.environ.get("TEMP_WIDGET_SETTINGS") or HERE / "settings.json").resolve()
 
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
+    set_dpi_awareness()
     configure_paths(path, Path(args.log).resolve() if args.log else None)
-    handle = single_instance(path)
+    handle = single_instance(path, wait=10 if args.restarted else 0)
     if handle is None:
         log(f"another widget with the same settings is already running, exiting (v{VERSION})")
         return

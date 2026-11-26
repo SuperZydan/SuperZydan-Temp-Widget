@@ -8,6 +8,8 @@ It is one Python file that uses only the standard library (tkinter), so there is
 
 White text with a thick black outline, purple labels, yellow for warm and red for hot. The yellow and red here are only showing because the warning limits were lowered for the screenshot.
 
+It follows Windows display scaling. The widget stays sharp at 100%, 125%, 150% and up, and resizes itself when you move it to a monitor with a different scale.
+
 ## What it shows
 
 - GPU temperature, fan, load and power draw (nvidia-smi)
@@ -39,11 +41,25 @@ Without LibreHardwareMonitor the widget still shows GPU temperature, fan, load, 
 4. Double-click `Start-Temp-Widget.bat`. It finds Python through the `py` launcher or `pythonw` on your PATH and runs the widget without a console window.
 5. On the first run the widget creates `settings.json` next to the script (a copy of `settings.example.json`).
 
-Left-drag the widget to move it. Right-click it for the menu: Settings, layout, size, lock position, start with Windows, copy the overlay URL, test the alert hook, peak temps, open the log, quit.
+Left-drag the widget to move it. Right-click it for the menu: Settings, layout, size, lock position, start with Windows, copy the overlay URL, test the alert hook, peak temps, open the log, restart, quit.
 
 To start it with Windows, use **Start with Windows** in the menu or the Settings window. That puts a small `.vbs` file in your Startup folder. Untick it to remove the file.
 
-If the widget is already running, starting it a second time does nothing.
+If the widget is already running, starting it a second time does nothing. To start a fresh copy, for example after updating the files, use **Restart** in the menu or the Settings window.
+
+## Uninstall
+
+Open **Settings...** and click **Uninstall...**. After you confirm, it removes what makes the widget start or show up:
+
+- the `Temp Widget.vbs` entry in your Startup folder
+- the scheduled task named `SuperZydan Temp Widget`, if you made one
+- desktop shortcuts (yours or the all-users desktop) that start this widget
+
+Each of these is only removed if it starts the copy you are uninstalling. One that points at a copy in another folder is left alone.
+
+Tick **Also delete my settings, logs and history** to remove `settings.json`, the log files and the history CSVs as well. It is off by default. The widget then closes and shows what it removed, what it left alone and anything it could not remove (a scheduled task or a shared desktop shortcut made as administrator may need to be deleted by hand).
+
+It never deletes the program folder. Delete that yourself afterwards. LibreHardwareMonitor is a separate program, so uninstall it on its own if you no longer need it.
 
 ## Settings window
 
@@ -62,13 +78,15 @@ The **General** tab has:
 - stream overlay on/off, port, and a button that copies the URL
 - start with Windows, lock position
 
+Along the bottom: open `settings.json`, [Uninstall](#uninstall), Restart and Close.
+
 The **Appearance** tab has:
 
 ![Appearance settings](screenshots/settings-appearance.png)
 
 - colors for labels, values, secondary text, outline, warning and hot. Each one has a swatch, an editable hex code, the Windows color dialog, and an eyedropper. For the eyedropper, click **Eyedropper**, then click any pixel on any monitor. Esc or right-click cancels.
 - a font for the big numbers and one for the small text, picked from your installed fonts, with a live preview. `(auto)` uses Montserrat Black if you have it, then Segoe UI Black, Arial Black, Arial.
-- outline thickness from 0 (no outline) to 8 pixels
+- outline thickness from 0 (no outline) to 8 pixels (at 100% display scaling, it grows with the scale)
 - **Give the overlay its own colors and fonts**: when off, the overlay uses the desktop look. When on, switch the **Editing** option to Stream overlay to change the overlay separately.
 - **Reset appearance to default** puts the white, purple, yellow look back for whichever one you are editing.
 
@@ -115,10 +133,10 @@ If port 8086 is taken by something else, change `overlay.port` in the Settings w
 | `refresh_seconds` | how often sensors are read, 1 to 60 |
 | `layout` | `vertical` or `horizontal` |
 | `size` | `Small`, `Medium` or `Large` |
-| `x`, `y`, `locked` | window position, and whether dragging is disabled |
+| `x`, `y`, `locked` | window position in screen pixels, and whether dragging is disabled |
 | `colors` | `label`, `text` (values), `detail` (secondary text), `warn`, `hot`, `outline`, as `#RRGGBB` |
 | `fonts` | `big` and `small` font names, empty for automatic |
-| `outline_width` | outline thickness in pixels, 0 to 8 |
+| `outline_width` | outline thickness in pixels at 100% scaling, 0 to 8 |
 | `show` | true/false for each line: `gpu_temp`, `gpu_details`, `gpu_hotspot`, `gpu_memory_temp`, `vram`, `cpu_temp`, `cpu_load`, `ram` |
 | `thresholds` | `warn` and `hot` for `gpu`, `gpu_hotspot`, `gpu_memory`, `cpu` (in °C) and `vram`, `ram` (in % used) |
 | `lhm_url` | LibreHardwareMonitor's data address, default `http://localhost:8085/data.json` |
@@ -236,10 +254,11 @@ To make a desktop shortcut, create one to `Start-Temp-Widget.bat` and pick `temp
 
 - Only NVIDIA GPUs are read through nvidia-smi. Hotspot and memory temps come from LibreHardwareMonitor, so they show up for any card it supports.
 - Temperatures are in °C.
-- Command line options: `--settings <file>` uses a different settings file (and allows a second widget), `--open-settings [general|appearance]` opens the Settings window on start, `--log <file>` writes the log somewhere else, `--version` prints the version, `--test-crash main|thread|tk` raises a fake error to check that tracebacks reach the log. A widget started with `--settings` keeps its log (`<settings name>.log`) and history (`<settings name>-history/`) next to that file, so a test copy never writes into your main widget's log.
+- Command line options: `--settings <file>` uses a different settings file (and allows a second widget), `--open-settings [general|appearance]` opens the Settings window on start, `--log <file>` writes the log somewhere else, `--restarted` (added by **Restart**) waits up to 10 seconds for the old widget to exit, `--version` prints the version, `--test-crash main|thread|tk` raises a fake error to check that tracebacks reach the log. A widget started with `--settings` keeps its log (`<settings name>.log`) and history (`<settings name>-history/`) next to that file, so a test copy never writes into your main widget's log.
 
 ## Changes
 
+- **v1.2**: Fixed: with Windows display scaling above 100%, lines overlapped and the top line was cut off. Spacing now comes from the real font sizes, the widget is per-monitor DPI aware and redraws when it moves to a monitor with a different scale. New **Restart** (Settings and right-click menu) and **Uninstall** (Settings). If your monitors use scaling other than 100%, the widget may appear in a slightly different spot the first time you run this version. Drag it back once and it stays.
 - **v1.1.1**: when `nvidia-smi` times out or fails the widget now says "nvidia-smi not responding" ("not found" is only for a missing program). A widget started with `--settings` writes its log and history next to that settings file instead of into the main widget's. `--log <file>` picks the log location. Open log folder opens the folder the log is really in.
 - **v1.1**: logging (startup report, source changes, tracebacks for every crash, debug option), optional temperature history, peak temps window, open log shortcuts, version shown in Settings. Fixed: a second widget could silently share the overlay port instead of reporting that it was in use.
 - **v1.0**: first release.
